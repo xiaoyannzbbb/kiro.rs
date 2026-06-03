@@ -54,6 +54,20 @@ export interface BalanceResponse {
   overageCapabilityRaw?: string
 }
 
+// 某凭据当前可用的模型列表响应
+export interface AvailableModelsResponse {
+  id: number
+  models: AvailableModelItem[]
+}
+
+// 单个可用模型
+export interface AvailableModelItem {
+  modelId: string
+  modelName?: string
+  description?: string
+  maxInputTokens?: number
+}
+
 // 成功响应
 export interface SuccessResponse {
   success: boolean

@@ -3,6 +3,7 @@ import { storage } from '@/lib/storage'
 import type {
   CredentialsStatusResponse,
   BalanceResponse,
+  AvailableModelsResponse,
   SuccessResponse,
   SetDisabledRequest,
   SetPriorityRequest,
@@ -146,6 +147,12 @@ export async function clearThrottle(id: number): Promise<SuccessResponse> {
 // 获取凭据余额
 export async function getCredentialBalance(id: number): Promise<BalanceResponse> {
   const { data } = await api.get<BalanceResponse>(`/credentials/${id}/balance`)
+  return data
+}
+
+// 获取凭据当前可用的模型列表（按需实时查询上游）
+export async function getCredentialModels(id: number): Promise<AvailableModelsResponse> {
+  const { data } = await api.get<AvailableModelsResponse>(`/credentials/${id}/models`)
   return data
 }
 

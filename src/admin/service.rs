@@ -20,7 +20,8 @@ use super::error::AdminServiceError;
 use super::proxy_pool::{GetUrlResult, ProxyPoolManager};
 use super::types::{
     AccountThrottleConfigResponse, AddCredentialRequest, AddCredentialResponse,
-    AssignProxyRequest, AssignRoundRobinResponse, BalanceResponse, BatchAddProxyRequest,
+    AssignProxyRequest, AssignRoundRobinResponse, AvailableModelItem, AvailableModelsResponse,
+    BalanceResponse, BatchAddProxyRequest,
     CheckRateLimitRequest, CredentialStatusItem, CredentialsStatusResponse, EnableOverageAllResult,
     GitHubRateLimitInfo, ImageUpdateResponse, KamExportAccount, KamExportResponse,
     LoadBalancingModeResponse, LogGovernanceConfigResponse, PollIdcLoginResponse,
@@ -637,6 +638,31 @@ impl AdminService {
                 .as_ref()
                 .and_then(|s| s.overage_capability.clone()),
         })
+    }
+
+    /// 获取指定凭据当前可用的模型列表（按需实时查询上游，不缓存）
+    pub async fn get_available_models(
+        &self,
+        id: u64,
+    ) -> Result<AvailableModelsResponse, AdminServiceError> {
+        let resp = self
+            .token_manager
+            .get_available_models_for(id)
+            .await
+            .map_err(|e| self.classify_balance_error(e, id))?;
+
+        let models = resp
+            .models
+            .into_iter()
+            .map(|m| AvailableModelItem {
+                model_id: m.model_id,
+                model_name: m.model_name,
+                description: m.description,
+                max_input_tokens: m.token_limits.and_then(|t| t.max_input_tokens),
+            })
+            .collect();
+
+        Ok(AvailableModelsResponse { id, models })
     }
 
     /// 批量刷新所有非禁用凭据的余额（用于后台调度）

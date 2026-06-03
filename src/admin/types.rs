@@ -240,6 +240,35 @@ pub struct BalanceResponse {
     pub overage_capability_raw: Option<String>,
 }
 
+// ============ 可用模型查询 ============
+
+/// 某个凭据当前可用的模型列表响应
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AvailableModelsResponse {
+    /// 凭据 ID
+    pub id: u64,
+    /// 该凭据（按订阅等级）当前可用的模型
+    pub models: Vec<AvailableModelItem>,
+}
+
+/// 单个可用模型
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AvailableModelItem {
+    /// 模型 ID
+    pub model_id: String,
+    /// 模型展示名
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub model_name: Option<String>,
+    /// 模型描述
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    /// 最大输入 Token 数
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_input_tokens: Option<i64>,
+}
+
 // ============ 一键超额 ============
 
 /// 一键超额禁用结果

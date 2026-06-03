@@ -13,7 +13,7 @@ use super::{
         complete_social_relogin, create_client_key, delete_client_key, delete_credential,
         delete_proxy, disable_quota_exceeded, enable_overage_all, export_kam_credentials,
         force_refresh_token, get_account_throttle_config, get_all_credentials,
-        get_credential_balance, get_global_proxy, get_load_balancing_mode, get_log_governance_config,
+        get_credential_balance, get_credential_models, get_global_proxy, get_load_balancing_mode, get_log_governance_config,
         get_proxy_pool, get_update_config, list_client_keys, list_traces, trace_failure_stats, poll_idc_login,
         poll_idc_relogin, poll_social_login,
         poll_social_relogin, pull_update_image, reset_all_success_count, reset_client_key_stats,
@@ -77,6 +77,7 @@ pub fn create_admin_router(state: AdminState) -> Router {
         .route("/credentials/{id}/refresh", post(force_refresh_token))
         .route("/credentials/{id}/refresh-token", put(update_refresh_token))
         .route("/credentials/{id}/balance", get(get_credential_balance))
+        .route("/credentials/{id}/models", get(get_credential_models))
         .route("/credentials/{id}/proxy", post(assign_proxy_to_credential))
         .route("/proxy-pool", get(get_proxy_pool).post(add_proxy))
         .route("/proxy-pool/batch", post(batch_add_proxies))

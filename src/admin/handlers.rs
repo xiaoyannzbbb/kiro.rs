@@ -138,6 +138,18 @@ pub async fn get_credential_balance(
     }
 }
 
+/// GET /api/admin/credentials/:id/models
+/// 获取指定凭据当前可用的模型列表（按需实时查询上游）
+pub async fn get_credential_models(
+    State(state): State<AdminState>,
+    Path(id): Path<u64>,
+) -> impl IntoResponse {
+    match state.service.get_available_models(id).await {
+        Ok(response) => Json(response).into_response(),
+        Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
+    }
+}
+
 /// POST /api/admin/credentials/disable-quota-exceeded
 /// 一键禁用所有"已超额"凭据（remaining ≤ 0 或 usage_percentage ≥ 100）
 pub async fn disable_quota_exceeded(State(state): State<AdminState>) -> impl IntoResponse {
