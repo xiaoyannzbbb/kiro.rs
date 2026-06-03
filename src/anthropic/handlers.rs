@@ -196,11 +196,6 @@ fn last_attempt_outcome(tracer: &RequestTracer) -> Option<&'static str> {
     })
 }
 
-/// 将 KiroProvider 错误映射为 HTTP 响应
-///
-/// Also persists the upstream raw body to `logs/errors/{ts}-{request_id}-{kind}.json`,
-/// so it can be reproduced later with the `replay/` tool - this way issues like Anthropic 400 /
-/// Bedrock protocol mismatches can be diagnosed without relying on the client to resend.
 /// Image-budget warning threshold (in raw base64 chars, not decoded bytes).
 /// Emits a warning when the total base64 char count of all image content in one request exceeds this threshold.
 /// The threshold does not reject the request (the upstream makes the final call); it only gives operators more precise diagnostics.
@@ -246,6 +241,7 @@ fn count_image_budget(payload: &super::types::MessagesRequest) -> ImageBudget {
     }
 }
 
+/// 将 KiroProvider 错误映射为 HTTP 响应
 fn map_provider_error(err: Error) -> Response {
     let err_str = err.to_string();
 
