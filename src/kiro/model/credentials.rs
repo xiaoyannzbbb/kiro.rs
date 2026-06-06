@@ -307,8 +307,13 @@ impl KiroCredentials {
             return false;
         }
 
-        let is_social = self
-            .auth_method
+        self.profile_arn = Some(self.default_profile_arn().to_string());
+        true
+    }
+
+    /// 是否为 Social 登录（Github / Google）。
+    fn is_social_login(&self) -> bool {
+        self.auth_method
             .as_deref()
             .map(|m| m.eq_ignore_ascii_case("social"))
             .unwrap_or(false)
@@ -316,17 +321,17 @@ impl KiroCredentials {
                 .provider
                 .as_deref()
                 .map(|p| p.eq_ignore_ascii_case("github") || p.eq_ignore_ascii_case("google"))
-                .unwrap_or(false);
+                .unwrap_or(false)
+    }
 
-        self.profile_arn = Some(
-            if is_social {
-                SOCIAL_PROFILE_ARN
-            } else {
-                BUILDER_ID_PROFILE_ARN
-            }
-            .to_string(),
-        );
-        true
+    /// 凭据缺少显式 profileArn 时应使用的默认 ARN：
+    /// Social 登录用共享 Social ARN，其余（BuilderID 等）用 BuilderID 占位符。
+    fn default_profile_arn(&self) -> &'static str {
+        if self.is_social_login() {
+            SOCIAL_PROFILE_ARN
+        } else {
+            BUILDER_ID_PROFILE_ARN
+        }
     }
 
     /// 检查凭据是否支持 Opus 模型
@@ -366,6 +371,31 @@ impl KiroCredentials {
             Some(arn) if !is_placeholder_profile_arn(arn) => Some(arn),
             _ => None,
         }
+    }
+
+    /// 返回流式聊天端点（`generateAssistantResponse`）应发送的 profileArn。
+    ///
+    /// 与官方 Kiro IDE 行为一致：流式端点**始终**携带 profileArn，包括 BuilderID
+    /// 的占位符 ARN。新版上游对该端点强制要求该字段，缺失会返回
+    /// `HTTP 400 {"message":"profileArn is required for this request."}`，新模型
+    /// （如 claude-opus-4-8-thinking）同样命中。
+    ///
+    /// 这与 [`effective_profile_arn`](Self::effective_profile_arn) 不同：后者用于
+    /// 用量类 REST 接口（getUsageLimits 等），那里发送占位符会被以 403 拒绝，
+    /// 故跳过占位符；而流式端点恰恰需要占位符。
+    ///
+    /// - 已有显式 profileArn（真实 ARN / Social ARN / 占位符）→ 原样返回；
+    /// - 尚未填充 → 按登录方式推断默认占位符（Social → Social ARN，其余 → BuilderID）；
+    /// - API Key 凭据无 profileArn 概念 → 返回 `None`。
+    pub fn streaming_profile_arn(&self) -> Option<String> {
+        if self.is_api_key_credential() {
+            return None;
+        }
+        Some(
+            self.profile_arn
+                .clone()
+                .unwrap_or_else(|| self.default_profile_arn().to_string()),
+        )
     }
 }
 
@@ -491,6 +521,45 @@ mod tests {
         // 无 ARN → None
         cred.profile_arn = None;
         assert_eq!(cred.effective_profile_arn(), None);
+    }
+
+    #[test]
+    fn test_streaming_profile_arn_includes_placeholder() {
+        // 流式端点：显式占位符原样发送（与官方 IDE 一致，跳过会 400）
+        let mut cred = KiroCredentials::default();
+        cred.profile_arn = Some(BUILDER_ID_PROFILE_ARN.to_string());
+        assert_eq!(
+            cred.streaming_profile_arn().as_deref(),
+            Some(BUILDER_ID_PROFILE_ARN)
+        );
+
+        // 真实 ARN 原样发送
+        let real = "arn:aws:codewhisperer:us-east-1:123456789012:profile/REAL123";
+        cred.profile_arn = Some(real.to_string());
+        assert_eq!(cred.streaming_profile_arn().as_deref(), Some(real));
+
+        // 未填充 + 非 social → 回退 BuilderID 占位符
+        let mut builder = KiroCredentials::default();
+        builder.profile_arn = None;
+        builder.refresh_token = Some("r".to_string());
+        assert_eq!(
+            builder.streaming_profile_arn().as_deref(),
+            Some(BUILDER_ID_PROFILE_ARN)
+        );
+
+        // 未填充 + social → 回退 Social 共享 ARN
+        let mut social = KiroCredentials::default();
+        social.profile_arn = None;
+        social.auth_method = Some("social".to_string());
+        assert_eq!(
+            social.streaming_profile_arn().as_deref(),
+            Some(SOCIAL_PROFILE_ARN)
+        );
+
+        // API Key 凭据无 profileArn 概念 → None
+        let mut api = KiroCredentials::default();
+        api.kiro_api_key = Some("ksk_xxx".to_string());
+        assert_eq!(api.streaming_profile_arn(), None);
     }
 
     #[test]

@@ -20,6 +20,7 @@ use crate::http_client::{ProxyConfig, build_client};
 use crate::kiro::kiro_version::USAGE_API_KIRO_VERSION;
 use crate::kiro::machine_id;
 use crate::kiro::model::available_models::ListAvailableModelsResponse;
+use crate::kiro::model::available_profiles::ListAvailableProfilesResponse;
 use crate::kiro::model::credentials::KiroCredentials;
 use crate::kiro::model::token_refresh::{
     IdcRefreshRequest, IdcRefreshResponse, RefreshRequest, RefreshResponse,
@@ -527,6 +528,97 @@ pub(crate) async fn get_available_models(
     // 所有候选端点均失败（理论上循环内已 return / bail，此处为兜底）
     bail!(
         "权限不足，无法获取可用模型: {}",
+        last_error.unwrap_or_else(|| "无可用端点".to_string())
+    );
+}
+
+/// 获取该凭据可用的真实 profileArn 列表（`ListAvailableProfiles`）。
+///
+/// Enterprise / IAM Identity Center (IdC) 账号必须用真实 profileArn 调用流式端点；
+/// 该 ARN 既不是 BuilderID 占位符，也不在 OIDC 刷新响应里返回，只能通过本接口获取。
+///
+/// 上游接口（AWS JSON 1.0，**与用量类的 REST GET 不同**）：
+/// `POST https://q.{region}.amazonaws.com/`，请求头
+/// `x-amz-target: AmazonCodeWhispererService.ListAvailableProfiles`，
+/// `Content-Type: application/x-amz-json-1.0`，Body `{"maxResults":N}`。
+///
+/// 与 [`get_usage_limits`] 一样仅在 `us-east-1` / `eu-central-1` 提供服务，
+/// 依据凭据 SSO 区域选择主端点，主端点未返回 profile 时回退到另一个端点。
+pub(crate) async fn list_available_profiles(
+    credentials: &KiroCredentials,
+    config: &Config,
+    token: &str,
+    proxy: Option<&ProxyConfig>,
+) -> anyhow::Result<ListAvailableProfilesResponse> {
+    tracing::debug!("正在获取可用 profile 列表...");
+
+    let sso_region = credentials.effective_auth_region(config);
+    let candidates = rest_api_region_candidates(sso_region);
+    let machine_id = machine_id::generate_from_credentials(credentials, config);
+    let kiro_version = USAGE_API_KIRO_VERSION;
+    let os_name = &config.system_version;
+    let node_version = &config.node_version;
+
+    let user_agent = format!(
+        "aws-sdk-js/1.0.0 ua/2.1 os/{} lang/js md/nodejs#{} api/codewhispererruntime#1.0.0 m/N,E KiroIDE-{}-{}",
+        os_name, node_version, kiro_version, machine_id
+    );
+    let amz_user_agent = format!("aws-sdk-js/1.0.0 KiroIDE-{}-{}", kiro_version, machine_id);
+
+    let client = build_client(proxy, 60, config.tls_backend)?;
+
+    let mut last_error: Option<String> = None;
+    let mut empty_seen = false;
+    for region in candidates.iter() {
+        let host = format!("q.{}.amazonaws.com", region);
+        let url = format!("https://{}/", host);
+
+        let mut request = client
+            .post(&url)
+            .header("content-type", "application/x-amz-json-1.0")
+            .header(
+                "x-amz-target",
+                "AmazonCodeWhispererService.ListAvailableProfiles",
+            )
+            .header("x-amz-user-agent", &amz_user_agent)
+            .header("user-agent", &user_agent)
+            .header("host", &host)
+            .header("amz-sdk-invocation-id", uuid::Uuid::new_v4().to_string())
+            .header("amz-sdk-request", "attempt=1; max=1")
+            .header("Authorization", format!("Bearer {}", token))
+            .header("Connection", "close")
+            .body(r#"{"maxResults":10}"#);
+
+        if credentials.is_api_key_credential() {
+            request = request.header("tokentype", "API_KEY");
+        }
+
+        let response = request.send().await?;
+        let status = response.status();
+
+        if status.is_success() {
+            let data: ListAvailableProfilesResponse = response.json().await?;
+            // 该区域无 profile 时尝试另一个区域端点（账号可能在 eu-central-1）
+            if data.first_arn().is_none() {
+                empty_seen = true;
+                continue;
+            }
+            return Ok(data);
+        }
+
+        let body_text = response.text().await.unwrap_or_default();
+        last_error = Some(format!("{} {}", status, body_text));
+        // 403 等错误继续尝试下一个候选端点
+    }
+
+    // 没有任何端点返回 profile：若至少有一次成功但为空，视为"该账号无 Enterprise profile"
+    // （BuilderID 等），返回空结果让调用方回退到占位符逻辑。
+    if empty_seen {
+        return Ok(ListAvailableProfilesResponse::default());
+    }
+
+    bail!(
+        "获取可用 profile 失败: {}",
         last_error.unwrap_or_else(|| "无可用端点".to_string())
     );
 }
@@ -2095,6 +2187,72 @@ impl MultiTokenManager {
         }
         self.save_stats();
         Ok(count)
+    }
+
+    /// 解析并回填 Enterprise / IdC 账号的真实 profileArn。
+    ///
+    /// 流式端点（`generateAssistantResponse`）强制要求 profileArn：不带 → 400
+    /// `profileArn is required`；带 BuilderID 占位符 → 403 `bearer token invalid`。
+    /// 真实 profileArn 只能通过 `ListAvailableProfiles` 获取。
+    ///
+    /// 行为：
+    /// - API Key 凭据 / 已有真实（非占位符）profileArn → 直接返回，不发起网络请求；
+    /// - 否则调用上游 `ListAvailableProfiles`，命中真实 ARN 时写回凭据并持久化；
+    /// - 上游无 profile（如纯 BuilderID 账号）→ 返回 `None`，由调用方回退到占位符。
+    ///
+    /// 返回应当用于本次请求的 profileArn（`Some` 表示真实 ARN）。
+    pub async fn resolve_profile_arn_for(
+        &self,
+        id: u64,
+        token: &str,
+    ) -> anyhow::Result<Option<String>> {
+        use crate::kiro::model::credentials::is_placeholder_profile_arn;
+
+        let credentials = {
+            let entries = self.entries.lock();
+            entries
+                .iter()
+                .find(|e| e.id == id)
+                .map(|e| e.credentials.clone())
+                .ok_or_else(|| anyhow::anyhow!("凭据不存在: {}", id))?
+        };
+
+        // API Key 凭据没有 profileArn 概念
+        if credentials.is_api_key_credential() {
+            return Ok(None);
+        }
+
+        // 已有真实 ARN（含 Social 共享 ARN）→ 直接用，无需查询
+        if let Some(arn) = credentials.profile_arn.as_deref() {
+            if !is_placeholder_profile_arn(arn) {
+                return Ok(Some(arn.to_string()));
+            }
+        }
+
+        let global_proxy = self.proxy.lock().clone();
+        let effective_proxy = credentials.effective_proxy(global_proxy.as_ref());
+        let profiles =
+            list_available_profiles(&credentials, &self.config, token, effective_proxy.as_ref())
+                .await?;
+
+        let Some(arn) = profiles.first_arn().map(|s| s.to_string()) else {
+            // 无 Enterprise profile（如纯 BuilderID 账号）：保持占位符回退逻辑
+            return Ok(None);
+        };
+
+        // 写回真实 ARN 并持久化
+        {
+            let mut entries = self.entries.lock();
+            if let Some(entry) = entries.iter_mut().find(|e| e.id == id) {
+                entry.credentials.profile_arn = Some(arn.clone());
+            }
+        }
+        if let Err(e) = self.persist_credentials() {
+            tracing::warn!("profileArn 回填后持久化失败（不影响本次请求）: {}", e);
+        }
+        tracing::info!("凭据 #{} 已解析并回填真实 profileArn: {}", id, arn);
+
+        Ok(Some(arn))
     }
 
     /// 获取指定凭据的使用额度（Admin API）
