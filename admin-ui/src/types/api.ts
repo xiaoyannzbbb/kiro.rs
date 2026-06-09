@@ -381,6 +381,19 @@ export interface UpdateClientKeyRequest {
 // ============ 用量统计 ============
 
 export type StatsRange = '24h' | '7d' | '30d'
+export type StatsGranularity = 'hour' | 'day'
+
+export interface StatsTimeFilter {
+  range?: StatsRange
+  startDate?: string
+  endDate?: string
+  granularity: StatsGranularity
+}
+
+export interface StatsFilter {
+  /** 不传 = 全部；0 = 管理员API密钥；其它值 = 创建的客户端 Key id */
+  keyId?: number
+}
 
 export interface OverviewStats {
   todayCalls: number
@@ -445,6 +458,10 @@ export interface TraceRecord {
   traceId: string
   ts: string
   keyId: number
+  /** masterApiKey = 管理员API密钥；clientKey = 创建的客户端 Key */
+  keySource: 'masterApiKey' | 'clientKey'
+  /** 创建的客户端 Key 名称；管理员业务 Key 为 null */
+  keyName?: string | null
   model: string
   isStream: boolean
   /** success / error / interrupted */
