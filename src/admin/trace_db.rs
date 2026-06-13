@@ -182,6 +182,9 @@ pub struct TraceQuery {
     pub model: Option<String>,
     /// 仅返回非 success
     pub only_failed: bool,
+    /// 按账号分组筛选：只返回最终凭据属于这些 id 的 trace。
+    /// 由 handler 层在查询前根据 group 参数转换为凭据 id 白名单填入。
+    pub credential_ids: Option<Vec<u64>>,
     /// 返回条数上限
     pub limit: usize,
     /// 偏移量（分页用）
@@ -399,22 +402,22 @@ impl TraceStore {
 
     /// 把 [`TraceQuery`] 的过滤条件拼成 WHERE 子句 + 参数（值全部参数化绑定）
     fn build_where(q: &TraceQuery) -> (String, Vec<Box<dyn rusqlite::ToSql>>) {
-        let mut clauses: Vec<&str> = Vec::new();
+        let mut clauses: Vec<String> = Vec::new();
         let mut params: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
         if let Some(s) = &q.status {
-            clauses.push("final_status = ?");
+            clauses.push("final_status = ?".to_string());
             params.push(Box::new(s.clone()));
         }
         if let Some(t) = &q.error_type {
-            clauses.push("error_type = ?");
+            clauses.push("error_type = ?".to_string());
             params.push(Box::new(t.clone()));
         }
         if let Some(c) = q.credential_id {
-            clauses.push("final_credential_id = ?");
+            clauses.push("final_credential_id = ?".to_string());
             params.push(Box::new(c as i64));
         }
         if let Some(k) = q.key_id {
-            clauses.push("key_id = ?");
+            clauses.push("key_id = ?".to_string());
             params.push(Box::new(k as i64));
         }
         if let Some(c) = q.failed_attempt_credential_id {
@@ -422,16 +425,32 @@ impl TraceStore {
             clauses.push(
                 "EXISTS (SELECT 1 FROM trace_attempts a \
                  WHERE a.trace_id = traces.trace_id \
-                 AND a.credential_id = ? AND a.outcome != 'success')",
+                 AND a.credential_id = ? AND a.outcome != 'success')"
+                    .to_string(),
             );
             params.push(Box::new(c as i64));
         }
         if let Some(m) = &q.model {
-            clauses.push("model = ?");
+            clauses.push("model = ?".to_string());
             params.push(Box::new(m.clone()));
         }
+        if let Some(ids) = &q.credential_ids {
+            if ids.is_empty() {
+                // 空白名单 = 该分组下无凭据 → 强制零匹配
+                clauses.push("1=0".to_string());
+            } else {
+                let placeholders: Vec<&str> = ids.iter().map(|_| "?").collect();
+                clauses.push(format!(
+                    "final_credential_id IN ({})",
+                    placeholders.join(",")
+                ));
+                for id in ids {
+                    params.push(Box::new(*id as i64));
+                }
+            }
+        }
         if q.only_failed {
-            clauses.push("final_status != 'success'");
+            clauses.push("final_status != 'success'".to_string());
         }
         let where_sql = if clauses.is_empty() {
             String::new()

@@ -517,6 +517,8 @@ export interface TraceQuery {
   /** 该凭据在某一跳失败过（即便 trace 最终成功）——用于凭据失败详情 */
   failedAttemptCredentialId?: number
   model?: string
+  /** 按账号分组名筛选（只返回 final_credential_id 属于该分组的 trace） */
+  group?: string
   onlyFailed?: boolean
   limit?: number
   offset?: number

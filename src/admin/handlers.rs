@@ -1127,12 +1127,25 @@ pub async fn stats_by_credential(
 
 /// GET /api/admin/traces
 /// 查询请求链路追踪记录（含每跳明细）。
-/// query 参数：status / errorType / credentialId / model / onlyFailed / limit / offset
+/// query 参数：status / errorType / credentialId / keyId / group / model / onlyFailed / limit / offset
 /// 返回：{ records: [...], total: N }
 pub async fn list_traces(
     State(state): State<AdminState>,
     Query(params): Query<std::collections::HashMap<String, String>>,
 ) -> impl IntoResponse {
+    // 解析分组筛选：把 group 名转为凭据 id 白名单（先于查询执行，避免分页错位）
+    let group = params.get("group").map(|s| s.trim().to_string()).filter(|s| !s.is_empty());
+    let credential_ids: Option<Vec<u64>> = group.as_ref().map(|g| {
+        state
+            .service
+            .get_all_credentials()
+            .credentials
+            .iter()
+            .filter(|c| c.groups.iter().any(|cg| cg == g))
+            .map(|c| c.id)
+            .collect()
+    });
+
     let query = TraceQuery {
         status: params.get("status").filter(|s| !s.is_empty()).cloned(),
         error_type: params.get("errorType").filter(|s| !s.is_empty()).cloned(),
@@ -1148,6 +1161,7 @@ pub async fn list_traces(
             .get("onlyFailed")
             .map(|s| s == "true" || s == "1")
             .unwrap_or(false),
+        credential_ids,
         limit: params
             .get("limit")
             .and_then(|s| s.parse::<usize>().ok())
