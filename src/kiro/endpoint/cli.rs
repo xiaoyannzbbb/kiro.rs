@@ -83,8 +83,8 @@ impl KiroEndpoint for CliEndpoint {
             .header("amz-sdk-request", "attempt=1; max=3")
             .header("Authorization", format!("Bearer {}", ctx.token));
 
-        if ctx.credentials.is_api_key_credential() {
-            req = req.header("tokentype", "API_KEY");
+        if let Some(tt) = ctx.credentials.token_type_header() {
+            req = req.header("tokentype", tt);
         }
         req
     }
@@ -101,8 +101,8 @@ impl KiroEndpoint for CliEndpoint {
         if let Some(arn) = ctx.credentials.effective_profile_arn() {
             req = req.header("x-amzn-kiro-profile-arn", arn);
         }
-        if ctx.credentials.is_api_key_credential() {
-            req = req.header("tokentype", "API_KEY");
+        if let Some(tt) = ctx.credentials.token_type_header() {
+            req = req.header("tokentype", tt);
         }
         req
     }
@@ -116,7 +116,7 @@ impl KiroEndpoint for CliEndpoint {
 /// 1. 所有 "AI_EDITOR" origin 替换为 "KIRO_CLI"
 /// 2. 移除 conversationState.agentContinuationId（Kiro CLI 不发送此字段）
 /// 3. 移除 history 中用户消息的 modelId（Kiro CLI 不在历史消息里发送此字段）
-fn set_origin_kiro_cli(body: &str) -> String {
+pub(crate) fn set_origin_kiro_cli(body: &str) -> String {
     let body = body.replace("\"origin\":\"AI_EDITOR\"", "\"origin\":\"KIRO_CLI\"");
 
     let Ok(mut json) = serde_json::from_str::<serde_json::Value>(&body) else {

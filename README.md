@@ -293,6 +293,7 @@ Admin API 鉴权同样支持：
 | `proxyUrl` | 无 | 全局代理，支持 `http://`、`https://`、`socks5://` |
 | `proxyUsername` / `proxyPassword` | 无 | 全局代理认证 |
 | `loadBalancingMode` | `priority` | `priority` 或 `balanced` |
+| `externalIdpAllowedHosts` | Microsoft Entra 默认集合 | 企业外部 IdP（external_idp）登录允许对接的 IdP 主机后缀白名单（SSRF 防护）。配置后替换默认集合，可接入其它企业 IdP（如 `.okta.com`），建议后缀以 `.` 开头 |
 | `accountThrottleFailover` | `true` | 账号级 429 suspicious activity 时是否冷却并切换凭据 |
 | `accountThrottleCooldownSecs` | `1800` | 账号级风控冷却秒数 |
 | `extractThinking` | `true` | 非流式响应是否把旧 `<thinking>` 文本提取成 thinking block |
@@ -371,6 +372,41 @@ Enterprise / IdC 账号在流式调用前会按需调用 `ListAvailableProfiles`
 
 `provider` 可为 `Github` 或 `Google`。Social 登录会使用固定 Social profile ARN。
 
+#### 企业外部 IdP（External IdP / Microsoft 365 / Entra ID）
+
+面向使用企业身份提供商（当前主要是 Microsoft 365 / Entra ID）登录的 Kiro 账号。
+
+```json
+{
+  "refreshToken": "xxx",
+  "accessToken": "xxx",
+  "expiresAt": "2026-12-31T00:00:00Z",
+  "authMethod": "external_idp",
+  "provider": "Enterprise",
+  "clientId": "xxx",
+  "tokenEndpoint": "https://login.microsoftonline.com/<tenant>/oauth2/v2.0/token",
+  "issuerUrl": "https://login.microsoftonline.com/<tenant>/v2.0",
+  "scopes": "openid profile offline_access",
+  "profileArn": "arn:aws:codewhisperer:us-east-1:...:profile/XXXX"
+}
+```
+
+登录方式与 Social 共用同一个入口：在 Admin UI 点击 **Social 登录**，在浏览器打开
+托管登录页后输入企业邮箱即可。Kiro portal 会自动识别企业身份并把流程切换到
+external_idp 双腿流程（OIDC discovery → 跳转企业 IdP 登录 → 授权码兑换），本服务
+全程自动处理，无需额外操作。
+
+要点与限制：
+
+- **运行时请求会携带 `tokentype: EXTERNAL_IDP` 头**，并通过 `ListAvailableProfiles`
+  解析真实 `profileArn`（与 Enterprise/IdC 同理）。
+- **Token 刷新**走 `tokenEndpoint`（标准 OAuth2 public client，无需 `clientSecret`）。
+- **第一期仅支持本机回调模式**：需在本机运行本服务并用本机浏览器完成登录
+  （企业 IdP 通常只注册了 loopback 回调地址）。远程部署（配置了 `callbackBaseUrl`）
+  暂不支持 external_idp，遇到时回调页会给出明确提示。
+- 允许对接的 IdP 主机后缀由 `externalIdpAllowedHosts` 控制（默认仅 Microsoft Entra），
+  详见[配置](#configuration)。
+
 #### Kiro API Key
 
 ```json
@@ -394,10 +430,11 @@ KIRO_API_KEY=ksk_xxx ./kiro-rs
 | `id` | 凭据 ID，Admin 管理时自动分配 |
 | `refreshToken` / `accessToken` | OAuth token |
 | `expiresAt` | RFC3339 过期时间 |
-| `authMethod` | `idc`、`social`、`api_key`。旧值 `builder-id`、`iam` 会规范化为 `idc` |
+| `authMethod` | `idc`、`social`、`api_key`。旧值 `builder-id`、`iam` 会规范化为 `idc`；`external_idp` 用于企业外部 IdP 登录 |
 | `provider` | `BuilderId`、`Enterprise`、`Github`、`Google`、`IAM_SSO` 等 |
-| `clientId` / `clientSecret` | IdC 刷新 token 所需 OIDC client |
+| `clientId` / `clientSecret` | IdC 刷新 token 所需 OIDC client（external_idp 仅需 `clientId`，public client 无 secret） |
 | `startUrl` | Enterprise IAM Identity Center Start URL |
+| `tokenEndpoint` / `issuerUrl` / `scopes` | 企业外部 IdP（external_idp）刷新所需的 OIDC token 端点、issuer 与 scope |
 | `profileArn` | 真实 profile ARN 或已知固定 ARN；通常由程序维护 |
 | `priority` | 数字越小优先级越高 |
 | `region` | 凭据级 Region，兼容旧配置 |

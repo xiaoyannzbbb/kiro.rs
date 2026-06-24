@@ -131,6 +131,12 @@ pub(crate) async fn refresh_token(
         }
     });
 
+    // external_idp 优先分流：它有 clientId 但无 clientSecret（public client），
+    // 不能落入上面的自动判断；其 auth_method 总是显式 "external_idp"。
+    if credentials.is_external_idp() || auth_method.eq_ignore_ascii_case("external_idp") {
+        return refresh_external_idp_token(credentials, config, proxy).await;
+    }
+
     if auth_method.eq_ignore_ascii_case("idc")
         || auth_method.eq_ignore_ascii_case("builder-id")
         || auth_method.eq_ignore_ascii_case("iam")
@@ -322,6 +328,61 @@ async fn refresh_idc_token(
     Ok(new_credentials)
 }
 
+/// 刷新 External IdP Token（企业 IdP / Entra，public client）
+///
+/// 向凭据中存储的 `token_endpoint` 发起标准 OAuth2 `refresh_token` 授权（无
+/// client_secret）。复用 [`RefreshTokenInvalidError`]：当 IdP 返回 `invalid_grant`
+/// 时视为 refreshToken 永久失效，禁用凭据而非无限重试。
+async fn refresh_external_idp_token(
+    credentials: &KiroCredentials,
+    config: &Config,
+    proxy: Option<&ProxyConfig>,
+) -> anyhow::Result<KiroCredentials> {
+    use crate::kiro::auth::external_idp;
+
+    tracing::info!("正在刷新 External IdP Token...");
+
+    let refresh_token = credentials.refresh_token.as_ref().unwrap();
+    let token_endpoint = credentials
+        .token_endpoint
+        .as_deref()
+        .ok_or_else(|| anyhow::anyhow!("external_idp 刷新需要 tokenEndpoint"))?;
+    let client_id = credentials
+        .client_id
+        .as_deref()
+        .ok_or_else(|| anyhow::anyhow!("external_idp 刷新需要 clientId"))?;
+    let scopes = credentials.scopes.as_deref();
+
+    let resp = external_idp::refresh(token_endpoint, client_id, refresh_token, scopes, config, proxy)
+        .await
+        .map_err(|e| -> anyhow::Error {
+            // invalid_grant → refreshToken 永久失效
+            let msg = e.to_string();
+            if msg.contains("invalid_grant") {
+                RefreshTokenInvalidError {
+                    message: format!("External IdP refreshToken 已失效 (invalid_grant): {}", msg),
+                }
+                .into()
+            } else {
+                e
+            }
+        })?;
+
+    let mut new_credentials = credentials.clone();
+    new_credentials.access_token = Some(resp.access_token);
+
+    if let Some(new_refresh_token) = resp.refresh_token {
+        new_credentials.refresh_token = Some(new_refresh_token);
+    }
+
+    if let Some(expires_in) = resp.expires_in {
+        let expires_at = Utc::now() + Duration::seconds(expires_in);
+        new_credentials.expires_at = Some(expires_at.to_rfc3339());
+    }
+
+    Ok(new_credentials)
+}
+
 /// 官方 Kiro 用量 / 模型 REST 接口（getUsageLimits / ListAvailableModels /
 /// setUserPreference）仅在 `us-east-1` 与 `eu-central-1` 两个端点提供服务。
 ///
@@ -393,8 +454,8 @@ pub(crate) async fn get_usage_limits(
             .header("Authorization", format!("Bearer {}", token))
             .header("Connection", "close");
 
-        if credentials.is_api_key_credential() {
-            request = request.header("tokentype", "API_KEY");
+        if let Some(tt) = credentials.token_type_header() {
+            request = request.header("tokentype", tt);
         }
 
         let response = request.send().await?;
@@ -435,6 +496,86 @@ pub(crate) async fn get_usage_limits(
     );
 }
 
+/// 企业 external_idp 账号专用：复刻官方 Kiro CLI 的 `ListAvailableModels` 调用。
+///
+/// 上游接口（AWS-JSON POST，**与 IDE 的 REST GET 不同**）：
+/// `POST https://management.{region}.kiro.dev/?origin=KIRO_CLI&profileArn=...`
+/// - `x-amz-target: AmazonCodeWhispererService.ListAvailableModels`
+/// - `Content-Type: application/x-amz-json-1.0`
+/// - `x-amzn-codewhisperer-optout: false`、`tokentype: EXTERNAL_IDP`
+/// - Body：`{"origin":"KIRO_CLI","profileArn":"..."}`
+///
+/// `origin=KIRO_CLI` 决定模型目录：这些账号在 `AI_EDITOR` 目录下不含 Claude，
+/// 只有 `KIRO_CLI` 目录才返回完整 Claude 全家桶。
+async fn get_available_models_external_idp(
+    credentials: &KiroCredentials,
+    config: &Config,
+    token: &str,
+    proxy: Option<&ProxyConfig>,
+) -> anyhow::Result<ListAvailableModelsResponse> {
+    let region = credentials.effective_api_region(config);
+    let host = format!("management.{}.kiro.dev", region);
+
+    let user_agent = format!(
+        "aws-sdk-rust/1.3.15 ua/2.1 api/codewhispererruntime/0.1.16551 os/{} lang/rust/1.92.0 md/appVersion-{} app/AmazonQ-For-CLI",
+        config.system_version, config.kiro_version
+    );
+    let amz_user_agent =
+        "aws-sdk-rust/1.3.15 ua/2.1 api/codewhispererruntime/0.1.16551 lang/rust/1.92.0 m/F,C app/AmazonQ-For-CLI".to_string();
+
+    // profileArn：external_idp 账号登录时已解析真实 ARN；查询串与 body 都要带
+    let profile_arn = credentials.effective_profile_arn();
+    let url = match profile_arn {
+        Some(arn) => format!(
+            "https://{}/?origin=KIRO_CLI&profileArn={}",
+            host,
+            urlencoding::encode(arn)
+        ),
+        None => format!("https://{}/?origin=KIRO_CLI", host),
+    };
+    let body = match profile_arn {
+        Some(arn) => serde_json::json!({ "origin": "KIRO_CLI", "profileArn": arn }).to_string(),
+        None => serde_json::json!({ "origin": "KIRO_CLI" }).to_string(),
+    };
+
+    let client = build_client(proxy, 60, config.tls_backend)?;
+
+    let response = client
+        .post(&url)
+        .header("content-type", "application/x-amz-json-1.0")
+        .header(
+            "x-amz-target",
+            "AmazonCodeWhispererService.ListAvailableModels",
+        )
+        .header("x-amzn-codewhisperer-optout", "false")
+        .header("x-amz-user-agent", &amz_user_agent)
+        .header("user-agent", &user_agent)
+        .header("host", &host)
+        .header("amz-sdk-invocation-id", uuid::Uuid::new_v4().to_string())
+        .header("amz-sdk-request", "attempt=1; max=3")
+        .header("Authorization", format!("Bearer {}", token))
+        .header("tokentype", "EXTERNAL_IDP")
+        .header("Accept", "*/*")
+        .header("Connection", "close")
+        .body(body)
+        .send()
+        .await?;
+
+    let status = response.status();
+    if !status.is_success() {
+        let body_text = response.text().await.unwrap_or_default();
+        bail!(
+            "获取可用模型失败（external_idp / {}）: {} {}",
+            host,
+            status,
+            body_text
+        );
+    }
+
+    let data: ListAvailableModelsResponse = response.json().await?;
+    Ok(data)
+}
+
 /// 获取该凭据当前可用的模型列表
 ///
 /// 上游接口：`GET https://q.{api_region}.amazonaws.com/ListAvailableModels?origin=AI_EDITOR`
@@ -447,6 +588,12 @@ pub(crate) async fn get_available_models(
     proxy: Option<&ProxyConfig>,
 ) -> anyhow::Result<ListAvailableModelsResponse> {
     tracing::debug!("正在获取可用模型列表...");
+    // 企业 external_idp 账号：完全复刻官方 Kiro CLI 的模型列表调用
+    // （POST https://management.{region}.kiro.dev/?origin=KIRO_CLI，AWS-JSON）。
+    // IDE 端点（origin=AI_EDITOR）下这些账号的目录不含 Claude。
+    if credentials.is_external_idp() {
+        return get_available_models_external_idp(credentials, config, token, proxy).await;
+    }
 
     // ListAvailableModels 仅在 us-east-1 / eu-central-1 提供服务，
     // 依据凭据 SSO 区域选择主端点，403 时回退到另一个端点。
@@ -482,6 +629,8 @@ pub(crate) async fn get_available_models(
 
         let mut request = client
             .get(&url)
+            .header("x-amzn-codewhisperer-optout", "true")
+            .header("x-amzn-kiro-agent-mode", "vibe")
             .header("x-amz-user-agent", &amz_user_agent)
             .header("user-agent", &user_agent)
             .header("host", &host)
@@ -490,8 +639,8 @@ pub(crate) async fn get_available_models(
             .header("Authorization", format!("Bearer {}", token))
             .header("Connection", "close");
 
-        if credentials.is_api_key_credential() {
-            request = request.header("tokentype", "API_KEY");
+        if let Some(tt) = credentials.token_type_header() {
+            request = request.header("tokentype", tt);
         }
 
         let response = request.send().await?;
@@ -589,8 +738,8 @@ pub(crate) async fn list_available_profiles(
             .header("Connection", "close")
             .body(r#"{"maxResults":10}"#);
 
-        if credentials.is_api_key_credential() {
-            request = request.header("tokentype", "API_KEY");
+        if let Some(tt) = credentials.token_type_header() {
+            request = request.header("tokentype", tt);
         }
 
         let response = request.send().await?;
@@ -600,13 +749,29 @@ pub(crate) async fn list_available_profiles(
             let data: ListAvailableProfilesResponse = response.json().await?;
             // 该区域无 profile 时尝试另一个区域端点（账号可能在 eu-central-1）
             if data.first_arn().is_none() {
+                tracing::warn!(
+                    "ListAvailableProfiles 在 {} 返回空 profile 列表（tokentype={:?}），尝试下一个端点",
+                    region,
+                    credentials.token_type_header()
+                );
                 empty_seen = true;
                 continue;
             }
+            tracing::info!(
+                "ListAvailableProfiles 在 {} 命中 profile: {:?}",
+                region,
+                data.first_arn()
+            );
             return Ok(data);
         }
 
         let body_text = response.text().await.unwrap_or_default();
+        tracing::warn!(
+            "ListAvailableProfiles 在 {} 失败: {} {}",
+            region,
+            status,
+            body_text
+        );
         last_error = Some(format!("{} {}", status, body_text));
         // 403 等错误继续尝试下一个候选端点
     }
@@ -682,8 +847,8 @@ pub(crate) async fn set_user_preference(
             .header("Connection", "close")
             .json(&body);
 
-        if credentials.is_api_key_credential() {
-            request = request.header("tokentype", "API_KEY");
+        if let Some(tt) = credentials.token_type_header() {
+            request = request.header("tokentype", tt);
         }
 
         let response = request.send().await?;
@@ -2533,10 +2698,48 @@ impl MultiTokenManager {
         &self,
         id: u64,
     ) -> anyhow::Result<ListAvailableModelsResponse> {
-        let (token, credentials) = self.prepare_request_token(id).await?;
+        let (token, _credentials) = self.prepare_request_token(id).await?;
+
+        // 企业账号（Enterprise / external_idp）的可用模型按真实 profileArn 返回；
+        // 若尚未解析（登录时 ListAvailableProfiles 未命中或被跳过），此处再解析一次，
+        // 避免缺 profileArn 时上游退回基础模型集。
+        if let Err(e) = self.resolve_profile_arn_for(id, &token).await {
+            tracing::warn!("获取模型前解析 profileArn 失败（继续按现有 profileArn 查询）: {}", e);
+        }
+
+        // 重新读取（可能已回填 profileArn）
+        let credentials = {
+            let entries = self.entries.lock();
+            entries
+                .iter()
+                .find(|e| e.id == id)
+                .map(|e| e.credentials.clone())
+                .ok_or_else(|| anyhow::anyhow!("凭据不存在: {}", id))?
+        };
+        tracing::info!(
+            "获取凭据 #{} 可用模型：profileArn={}",
+            id,
+            credentials
+                .effective_profile_arn()
+                .unwrap_or("<none/placeholder>")
+        );
+
         let global_proxy = self.proxy.lock().clone();
         let effective_proxy = credentials.effective_proxy(global_proxy.as_ref());
-        get_available_models(&credentials, &self.config, &token, effective_proxy.as_ref()).await
+        let resp =
+            get_available_models(&credentials, &self.config, &token, effective_proxy.as_ref())
+                .await?;
+        tracing::info!(
+            "凭据 #{} 上游返回 {} 个可用模型: {}",
+            id,
+            resp.models.len(),
+            resp.models
+                .iter()
+                .map(|m| m.model_id.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+        Ok(resp)
     }
 
     /// 设置用户偏好（开启/关闭超额）— Admin API

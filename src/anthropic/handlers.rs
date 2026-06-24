@@ -133,6 +133,10 @@ pub(crate) struct RequestTracer {
     /// 首个上游 chunk 到达时刻（仅流式标记；取第一次）
     first_token_at: parking_lot::Mutex<Option<Instant>>,
     attempts: parking_lot::Mutex<Vec<TraceAttempt>>,
+    /// 是否已 finalize（幂等保护 + Drop 兜底判定）。
+    /// finalize 显式调用会置 true；若流被提前 drop 时仍为 false，
+    /// Drop 兜底补记一条 client_disconnected trace。
+    finalized: std::sync::atomic::AtomicBool,
 }
 
 /// 本次请求的用量快照（落入 trace 行，与 usage_log 同源）
@@ -171,6 +175,7 @@ impl RequestTracer {
             started_at: Instant::now(),
             first_token_at: parking_lot::Mutex::new(None),
             attempts: parking_lot::Mutex::new(Vec::new()),
+            finalized: std::sync::atomic::AtomicBool::new(false),
         }
     }
 
@@ -192,6 +197,13 @@ impl RequestTracer {
         usage: TraceUsage,
     ) {
         let Some(store) = &self.store else { return };
+        // 幂等：已 finalize 过则跳过（避免 Drop 兜底与显式 finalize 重复记录）
+        if self
+            .finalized
+            .swap(true, std::sync::atomic::Ordering::SeqCst)
+        {
+            return;
+        }
         let attempts = std::mem::take(&mut *self.attempts.lock());
         // 最终凭据：最后一跳的命中凭据（成功跳即命中凭据，失败跳即最后尝试的凭据）
         let final_credential_id = attempts.last().map(|a| a.credential_id).unwrap_or(0);
@@ -228,6 +240,36 @@ impl RequestTracer {
 impl TraceSink for RequestTracer {
     fn on_attempt(&self, attempt: TraceAttempt) {
         self.attempts.lock().push(attempt);
+    }
+}
+
+impl Drop for RequestTracer {
+    /// 兜底：若 tracer 在未显式 finalize 的情况下被 drop（典型场景：客户端在
+    /// SSE 流完成前断开连接，承载 `finalize` 的流 `unfold` 被丢弃），补记一条
+    /// trace，避免该请求在 traces 页完全不可见。
+    ///
+    /// 通过 `finalized` 标志与显式 finalize 互斥，保证不重复记录。
+    fn drop(&mut self) {
+        if self.store.is_none() {
+            return;
+        }
+        if self.finalized.load(std::sync::atomic::Ordering::SeqCst) {
+            return;
+        }
+        // 已开始返回内容（有 first_token）记为 interrupted，否则视为提前断开。
+        let started_streaming = self.first_token_at.lock().is_some();
+        let status = if started_streaming {
+            "interrupted"
+        } else {
+            "error"
+        };
+        self.finalize(
+            status,
+            Some(outcome::CLIENT_DISCONNECTED),
+            Some("client disconnected before the response stream completed"),
+            None,
+            TraceUsage::zero(),
+        );
     }
 }
 

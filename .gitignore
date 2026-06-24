@@ -31,3 +31,5 @@
 .ace-tool/
 .codegraph/
 .claude/
+admin-ui/pnpm-lock.yaml
+build-release.sh

@@ -140,6 +140,24 @@ pub struct KiroCredentials {
     #[serde(default)]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub source_channel: Option<String>,
+
+    /// 外部 IdP 的 OIDC token 端点（external_idp 登录专用）
+    ///
+    /// Token 刷新时向此端点发起 public client `refresh_token` 授权。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub token_endpoint: Option<String>,
+
+    /// 外部 IdP 的 issuer URL（external_idp 登录专用）
+    ///
+    /// 记录登录时使用的 IdP issuer，便于排查与必要时重新做 OIDC discovery。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub issuer_url: Option<String>,
+
+    /// 外部 IdP 的 OAuth scopes（external_idp 登录专用）
+    ///
+    /// 登录时使用的 scope 字符串（空格分隔），Token 刷新时原样回传。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub scopes: Option<String>,
 }
 
 /// 判断是否为零（用于跳过序列化）
@@ -185,6 +203,9 @@ impl std::fmt::Debug for KiroCredentials {
             .field("endpoint", &self.endpoint)
             .field("groups", &self.groups)
             .field("source_channel", &self.source_channel)
+            .field("token_endpoint", &self.token_endpoint)
+            .field("issuer_url", &self.issuer_url)
+            .field("scopes", &self.scopes)
             .finish()
     }
 }
@@ -194,6 +215,11 @@ fn canonicalize_auth_method_value(value: &str) -> &str {
         "idc"
     } else if value.eq_ignore_ascii_case("api_key") || value.eq_ignore_ascii_case("apikey") {
         "api_key"
+    } else if value.eq_ignore_ascii_case("external_idp")
+        || value.eq_ignore_ascii_case("external-idp")
+        || value.eq_ignore_ascii_case("externalidp")
+    {
+        "external_idp"
     } else {
         value
     }
@@ -378,6 +404,40 @@ impl KiroCredentials {
                 .unwrap_or(false)
     }
 
+    /// 检查是否为外部 IdP（external_idp）登录凭据
+    ///
+    /// 企业外部身份提供商（如 Microsoft 365 / Entra ID）登录的凭据。
+    /// 运行时上游调用须携带 `tokentype: EXTERNAL_IDP`，Token 刷新走 IdP 的
+    /// OIDC token 端点（public client）。
+    pub fn is_external_idp(&self) -> bool {
+        self.auth_method
+            .as_deref()
+            .map(|m| {
+                m.eq_ignore_ascii_case("external_idp")
+                    || m.eq_ignore_ascii_case("external-idp")
+                    || m.eq_ignore_ascii_case("externalidp")
+            })
+            .unwrap_or(false)
+    }
+
+    /// 返回上游 CodeWhisperer / Q 请求需要携带的 `tokentype` 头值。
+    ///
+    /// 统一抽象，替代散落各处的 `is_api_key_credential()` 单独判断：
+    /// - API Key 凭据 → `Some("API_KEY")`
+    /// - external_idp 凭据 → `Some("EXTERNAL_IDP")`
+    /// - 其余（social / idc / builder-id 等）→ `None`（不发送该头）
+    ///
+    /// 注意：API Key 判断优先于 external_idp（API Key 凭据不会同时是 external_idp）。
+    pub fn token_type_header(&self) -> Option<&'static str> {
+        if self.is_api_key_credential() {
+            Some("API_KEY")
+        } else if self.is_external_idp() {
+            Some("EXTERNAL_IDP")
+        } else {
+            None
+        }
+    }
+
     /// 返回「可发送给上游」的真实 profileArn（跳过 BuilderID 占位符）。
     ///
     /// - 真实 ARN（含 Social 共享 ARN）→ 原样返回；
@@ -491,6 +551,9 @@ mod tests {
             endpoint: None,
             groups: vec![],
             source_channel: None,
+            token_endpoint: None,
+            issuer_url: None,
+            scopes: None,
         };
 
         let json = creds.to_pretty_json().unwrap();
@@ -682,6 +745,9 @@ mod tests {
             endpoint: None,
             groups: vec![],
             source_channel: None,
+            token_endpoint: None,
+            issuer_url: None,
+            scopes: None,
         };
 
         let json = creds.to_pretty_json().unwrap();
@@ -717,6 +783,9 @@ mod tests {
             endpoint: None,
             groups: vec![],
             source_channel: None,
+            token_endpoint: None,
+            issuer_url: None,
+            scopes: None,
         };
 
         let json = creds.to_pretty_json().unwrap();
@@ -835,6 +904,9 @@ mod tests {
             endpoint: None,
             groups: vec![],
             source_channel: None,
+            token_endpoint: None,
+            issuer_url: None,
+            scopes: None,
         };
 
         let json = original.to_pretty_json().unwrap();
@@ -1098,5 +1170,106 @@ mod tests {
         let creds = KiroCredentials::default();
         let result = creds.effective_proxy(None);
         assert_eq!(result, None);
+    }
+
+    // ============ external_idp 相关测试 ============
+
+    #[test]
+    fn test_is_external_idp() {
+        let mut cred = KiroCredentials::default();
+        assert!(!cred.is_external_idp());
+
+        cred.auth_method = Some("external_idp".to_string());
+        assert!(cred.is_external_idp());
+
+        // 大小写与连字符变体
+        cred.auth_method = Some("EXTERNAL_IDP".to_string());
+        assert!(cred.is_external_idp());
+        cred.auth_method = Some("external-idp".to_string());
+        assert!(cred.is_external_idp());
+        cred.auth_method = Some("externalIdp".to_string());
+        assert!(cred.is_external_idp());
+
+        // 其它认证方式不应命中
+        cred.auth_method = Some("social".to_string());
+        assert!(!cred.is_external_idp());
+        cred.auth_method = Some("idc".to_string());
+        assert!(!cred.is_external_idp());
+    }
+
+    #[test]
+    fn test_token_type_header() {
+        // 普通 social/idc 凭据 → None
+        let mut cred = KiroCredentials::default();
+        cred.auth_method = Some("social".to_string());
+        assert_eq!(cred.token_type_header(), None);
+
+        // external_idp → EXTERNAL_IDP
+        cred.auth_method = Some("external_idp".to_string());
+        assert_eq!(cred.token_type_header(), Some("EXTERNAL_IDP"));
+
+        // API Key → API_KEY
+        let mut api = KiroCredentials::default();
+        api.kiro_api_key = Some("ksk_xxx".to_string());
+        assert_eq!(api.token_type_header(), Some("API_KEY"));
+
+        // API Key 判断优先于 external_idp（理论上不会共存，仍验证优先级）
+        let mut both = KiroCredentials::default();
+        both.kiro_api_key = Some("ksk_xxx".to_string());
+        both.auth_method = Some("external_idp".to_string());
+        assert_eq!(both.token_type_header(), Some("API_KEY"));
+    }
+
+    #[test]
+    fn test_canonicalize_external_idp() {
+        for raw in ["external-idp", "externalIdp", "EXTERNAL_IDP"] {
+            let mut cred = KiroCredentials::default();
+            cred.auth_method = Some(raw.to_string());
+            cred.canonicalize_auth_method();
+            assert_eq!(cred.auth_method.as_deref(), Some("external_idp"));
+        }
+    }
+
+    #[test]
+    fn test_external_idp_fields_roundtrip() {
+        let json = r#"{
+            "refreshToken": "r",
+            "authMethod": "external_idp",
+            "clientId": "client-123",
+            "tokenEndpoint": "https://login.microsoftonline.com/tid/oauth2/v2.0/token",
+            "issuerUrl": "https://login.microsoftonline.com/tid/v2.0",
+            "scopes": "openid profile offline_access"
+        }"#;
+        let cred = KiroCredentials::from_json(json).unwrap();
+        assert_eq!(cred.auth_method.as_deref(), Some("external_idp"));
+        assert_eq!(cred.client_id.as_deref(), Some("client-123"));
+        assert_eq!(
+            cred.token_endpoint.as_deref(),
+            Some("https://login.microsoftonline.com/tid/oauth2/v2.0/token")
+        );
+        assert_eq!(
+            cred.issuer_url.as_deref(),
+            Some("https://login.microsoftonline.com/tid/v2.0")
+        );
+        assert_eq!(
+            cred.scopes.as_deref(),
+            Some("openid profile offline_access")
+        );
+
+        // 序列化往返保留字段（camelCase）
+        let out = cred.to_pretty_json().unwrap();
+        assert!(out.contains("tokenEndpoint"));
+        assert!(out.contains("issuerUrl"));
+        assert!(out.contains("scopes"));
+    }
+
+    #[test]
+    fn test_external_idp_fields_none_not_serialized() {
+        let mut cred = KiroCredentials::default();
+        cred.refresh_token = Some("r".to_string());
+        let out = cred.to_pretty_json().unwrap();
+        assert!(!out.contains("tokenEndpoint"));
+        assert!(!out.contains("issuerUrl"));
+        assert!(!out.contains("\"scopes\""));
     }
 }

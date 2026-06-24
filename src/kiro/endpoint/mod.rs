@@ -12,9 +12,11 @@ use crate::kiro::model::credentials::KiroCredentials;
 use crate::model::config::Config;
 
 pub mod cli;
+pub mod external_idp;
 pub mod ide;
 
 pub use cli::CliEndpoint;
+pub use external_idp::ExternalIdpEndpoint;
 pub use ide::IdeEndpoint;
 
 /// Kiro 端点

@@ -182,6 +182,18 @@ pub struct AddCredentialRequest {
     /// 账号来源渠道（纯备注，可选）
     #[serde(default)]
     pub source_channel: Option<String>,
+
+    /// 外部 IdP 的 OIDC token 端点（external_idp 凭据导入用）
+    #[serde(default)]
+    pub token_endpoint: Option<String>,
+
+    /// 外部 IdP 的 issuer URL（external_idp 凭据导入用）
+    #[serde(default)]
+    pub issuer_url: Option<String>,
+
+    /// 外部 IdP 的 OAuth scopes（external_idp 凭据导入用）
+    #[serde(default)]
+    pub scopes: Option<String>,
 }
 
 fn default_auth_method() -> String {

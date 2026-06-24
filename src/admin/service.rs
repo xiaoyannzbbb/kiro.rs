@@ -12,6 +12,7 @@ use uuid::Uuid;
 use crate::http_client::ProxyConfig;
 use crate::kiro::auth::idc::{self, BUILDER_ID_START_URL};
 use crate::kiro::auth::social;
+use crate::kiro::auth::external_idp;
 use crate::kiro::model::credentials::KiroCredentials;
 use crate::kiro::token_manager::MultiTokenManager;
 use crate::model::config::Config;
@@ -176,8 +177,8 @@ struct SocialAuthSession {
     code_verifier: String,
     redirect_uri: String,
     expires_at: DateTime<Utc>,
-    /// 收到 OAuth 回调时的数据（code + login_option + path）
-    callback_rx: tokio::sync::Mutex<tokio::sync::oneshot::Receiver<social::OAuthCallbackData>>,
+    /// 收到 OAuth 回调时的结果（social 授权码 或 external_idp leg-2 授权码）
+    callback_rx: tokio::sync::Mutex<tokio::sync::oneshot::Receiver<social::CallbackResult>>,
     cred_template: KiroCredentials,
     proxy: Option<ProxyConfig>,
     /// Drop 时自动关闭回调服务器并释放端口（本地模式 Some；远程模式 None）
@@ -185,7 +186,10 @@ struct SocialAuthSession {
     /// 远程模式：公网 GET 回调路由通过此 Sender 投递回调数据（本地模式 None）。
     /// 取出后即 None，保证只投递一次。
     remote_callback_tx:
-        Option<Mutex<Option<tokio::sync::oneshot::Sender<social::OAuthCallbackData>>>>,
+        Option<Mutex<Option<tokio::sync::oneshot::Sender<social::CallbackResult>>>>,
+    /// 远程模式 external_idp：描述符腿建立后存储 leg-2 上下文，等待 IdP 把 code 打回来。
+    /// 按 leg-2 state 索引；取出后即 None。
+    remote_leg2: Option<Mutex<Option<RemoteLeg2Ctx>>>,
     /// 重新登录时更新此凭据的 Token（非 None 时更新已有凭据而非创建新凭据）
     relogin_target_id: Option<u64>,
 }
@@ -200,6 +204,22 @@ pub enum RemoteCallbackOutcome {
     Expired,
     /// 回调已被处理过（重复点击 / 并发完成）
     AlreadyCompleted,
+    /// external_idp 描述符腿：需要 302 跳转到企业 IdP 登录页
+    Redirect(String),
+}
+
+/// 远程模式 external_idp leg-2 上下文：描述符腿完成 discovery 后暂存，
+/// 等待 IdP 把授权码打回 `/oauth/callback` 时消费。
+struct RemoteLeg2Ctx {
+    /// leg-2 随机 state（CSRF）
+    state: String,
+    verifier: String,
+    token_endpoint: String,
+    issuer_url: String,
+    client_id: String,
+    scopes: String,
+    /// leg-2 的 redirect_uri（公网路由地址）
+    redirect_uri: String,
 }
 
 /// IdC 设备授权会话状态
@@ -1038,6 +1058,9 @@ impl AdminService {
             endpoint: req.endpoint,
             groups: req.groups,
             source_channel: req.source_channel,
+            token_endpoint: req.token_endpoint,
+            issuer_url: req.issuer_url,
+            scopes: req.scopes,
         };
 
         // 调用 token_manager 添加凭据
@@ -2464,25 +2487,30 @@ impl AdminService {
         // 回调模式：配置了 callbackBaseUrl → 远程模式（公网回调路由自动接收）；
         // 否则本地模式（启动临时 TCP 端口，仅本机浏览器可达）。
         let remote_base = self.resolve_callback_base(req.callback_base_url.as_deref());
-        let (redirect_uri, server_handle, remote_callback_tx, rx) = match remote_base.clone() {
+        let (redirect_uri, server_handle, remote_callback_tx, remote_leg2, rx) = match remote_base.clone() {
             Some(base) => {
-                let (tx, rx) = tokio::sync::oneshot::channel::<social::OAuthCallbackData>();
+                let (tx, rx) = tokio::sync::oneshot::channel::<social::CallbackResult>();
                 // 远程模式：暂存 Sender，由公网 GET 回调路由投递回调数据
                 (
                     base,
                     None,
                     Some(Mutex::new(Some(tx))),
+                    Some(Mutex::new(None::<RemoteLeg2Ctx>)), // 供描述符腿存储 leg-2 上下文
                     rx,
                 )
             }
             None => {
-                let (tx, rx) = tokio::sync::oneshot::channel::<social::OAuthCallbackData>();
-                let (port, server_handle) = social::start_callback_server(tx)
-                    .map_err(|e| AdminServiceError::InternalError(e.to_string()))?;
+                let (tx, rx) = tokio::sync::oneshot::channel::<social::CallbackResult>();
+                let config = self.token_manager.config().clone();
+                let allowed = config.effective_external_idp_allowed_hosts();
+                let (port, server_handle) =
+                    social::start_callback_server(tx, config, proxy.clone(), allowed)
+                        .map_err(|e| AdminServiceError::InternalError(e.to_string()))?;
                 (
                     format!("http://127.0.0.1:{}", port),
                     Some(server_handle),
                     None,
+                    None::<Mutex<Option<RemoteLeg2Ctx>>>, // 本地模式无 remote_leg2
                     rx,
                 )
             }
@@ -2511,6 +2539,7 @@ impl AdminService {
             proxy,
             _server_handle: server_handle,
             remote_callback_tx,
+            remote_leg2,
             relogin_target_id: None,
         };
 
@@ -2538,7 +2567,7 @@ impl AdminService {
             Expired,
             Closed,
             Pending,
-            Received(social::OAuthCallbackData),
+            Received(social::CallbackResult),
         }
 
         let outcome = {
@@ -2579,10 +2608,26 @@ impl AdminService {
         }
     }
 
-    /// 内部：完成 Social 登录的 token 兑换和凭据创建（供轮询回调和手动完成共用）
+    /// 内部：完成登录的 token 兑换和凭据创建（供轮询回调和手动完成共用）
     ///
-    /// 调用前须确认 session 存在且未过期。会在内部做 state CSRF 校验。
+    /// 调用前须确认 session 存在且未过期。根据回调结果分发到 social 或 external_idp 分支。
     async fn do_complete_social_login(
+        &self,
+        session_id: &str,
+        result: social::CallbackResult,
+    ) -> Result<PollIdcLoginResponse, AdminServiceError> {
+        match result {
+            social::CallbackResult::Social(callback) => {
+                self.complete_social_inner(session_id, callback).await
+            }
+            social::CallbackResult::ExternalIdp(ei) => {
+                self.complete_external_idp_inner(session_id, ei).await
+            }
+        }
+    }
+
+    /// 完成 social（Google/GitHub）登录：CSRF 校验 + token 兑换 + 建/更新凭据。
+    async fn complete_social_inner(
         &self,
         session_id: &str,
         callback: social::OAuthCallbackData,
@@ -2679,6 +2724,95 @@ impl AdminService {
         Ok(PollIdcLoginResponse::Success { credential_id })
     }
 
+    /// 完成 external_idp（企业 IdP）登录：IdP token 兑换 + 解析 profileArn + 建/更新凭据。
+    ///
+    /// leg-2 的 state CSRF 已在回调服务器内校验，此处不再重复校验 session.state。
+    async fn complete_external_idp_inner(
+        &self,
+        session_id: &str,
+        ei: social::ExternalIdpCallback,
+    ) -> Result<PollIdcLoginResponse, AdminServiceError> {
+        // 移除 session（含敏感数据）
+        let session = self
+            .social_sessions
+            .lock()
+            .remove(session_id)
+            .ok_or(AdminServiceError::NotFound { id: 0 })?;
+
+        let config = self.token_manager.config();
+
+        // IdP token 端点兑换（public client）
+        let token = external_idp::exchange_code(
+            &ei.token_endpoint,
+            &ei.client_id,
+            &ei.code,
+            &ei.code_verifier,
+            &ei.redirect_uri,
+            &ei.scopes,
+            config,
+            session.proxy.as_ref(),
+        )
+        .await
+        .map_err(|e| AdminServiceError::InternalError(e.to_string()))?;
+
+        // 重新登录模式：仅更新 refreshToken
+        if let Some(target_id) = session.relogin_target_id {
+            let refresh_token = token.refresh_token.ok_or_else(|| {
+                AdminServiceError::InternalError(
+                    "External IdP 登录未返回 refreshToken，无法更新凭据".to_string(),
+                )
+            })?;
+            self.do_relogin_update(target_id, refresh_token)
+                .map_err(|e| AdminServiceError::InternalError(e.to_string()))?;
+            tracing::info!("External IdP 重新登录成功，凭据 #{} Token 已更新", target_id);
+            return Ok(PollIdcLoginResponse::Success {
+                credential_id: target_id,
+            });
+        }
+
+        // 基于 social 入口的模板创建 external_idp 凭据（覆盖认证方式与 IdP 字段）
+        let mut new_cred = session.cred_template;
+        new_cred.auth_method = Some("external_idp".to_string());
+        new_cred.provider = Some("Enterprise".to_string());
+        let access_token = token.access_token.clone();
+        new_cred.access_token = Some(token.access_token);
+        new_cred.refresh_token = token.refresh_token;
+        new_cred.expires_at = token
+            .expires_in
+            .map(|secs| (Utc::now() + Duration::seconds(secs)).to_rfc3339());
+        new_cred.client_id = Some(ei.client_id);
+        new_cred.token_endpoint = Some(ei.token_endpoint);
+        new_cred.issuer_url = Some(ei.issuer_url);
+        new_cred.scopes = Some(ei.scopes);
+
+        let credential_id = self
+            .token_manager
+            .add_credential(new_cred)
+            .await
+            .map_err(|e| AdminServiceError::InternalError(e.to_string()))?;
+
+        // 解析真实 profileArn（带 TokenType: EXTERNAL_IDP，由 token_type_header 自动注入）。
+        // 失败不阻断登录：流式请求时还会再次尝试解析。
+        if let Err(e) = self
+            .token_manager
+            .resolve_profile_arn_for(credential_id, &access_token)
+            .await
+        {
+            tracing::warn!(
+                "External IdP 登录后解析 profileArn 失败（不影响登录，后续会重试）: {}",
+                e
+            );
+        }
+
+        // 主动刷新余额（含订阅等级 / 邮箱）
+        if let Err(e) = self.get_balance(credential_id).await {
+            tracing::warn!("External IdP 登录后刷新余额失败（不影响登录）: {}", e);
+        }
+
+        tracing::info!("External IdP 登录成功，已添加凭据 #{}", credential_id);
+        Ok(PollIdcLoginResponse::Success { credential_id })
+    }
+
     /// 手动完成 Social 登录：远程访问时从浏览器地址栏粘贴的回调 URL 中提取参数，直接完成 token 兑换
     pub async fn complete_social_login(
         &self,
@@ -2705,7 +2839,8 @@ impl AdminService {
             path,
             state,
         };
-        self.do_complete_social_login(session_id, callback).await
+        self.do_complete_social_login(session_id, social::CallbackResult::Social(callback))
+            .await
     }
 
     /// 解析远程回调 base，优先级：`config.callbackBaseUrl`（显式覆盖 / 逃生口）> 请求自带 base > None（本地模式）。
@@ -2731,7 +2866,35 @@ impl AdminService {
             );
             return None;
         }
+        // 若回调地址是 loopback（127.x / localhost / ::1），说明浏览器与服务同机，
+        // 回落本地 loopback 回调模式：启动本地 3128 回调服务器，
+        // external_idp 的 leg-2 也用 localhost:3128（Entra 已注册），本机浏览器可直接打开，
+        // 全程无需手动改 URL。
+        if Self::is_loopback_base(trimmed) {
+            tracing::info!("回调地址为 loopback（{}），使用本地回调模式", trimmed);
+            return None;
+        }
         Some(trimmed.to_string())
+    }
+
+    /// 判断回调 base URL 的主机是否为 loopback（127.x / localhost / ::1）。
+    fn is_loopback_base(url: &str) -> bool {
+        // 取 scheme:// 之后、第一个 '/' 之前的 authority，再取 host（去端口）
+        let after_scheme = match url.split_once("://") {
+            Some((_, rest)) => rest,
+            None => return false,
+        };
+        let authority = after_scheme.split('/').next().unwrap_or("");
+        // 去掉可能的 userinfo
+        let host_port = authority.rsplit('@').next().unwrap_or(authority);
+        // IPv6 [::1]:port
+        let host = if let Some(stripped) = host_port.strip_prefix('[') {
+            stripped.split(']').next().unwrap_or("")
+        } else {
+            host_port.split(':').next().unwrap_or("")
+        };
+        let host = host.to_ascii_lowercase();
+        host == "localhost" || host == "::1" || host.starts_with("127.")
     }
 
     /// 公网 GET 回调路由调用：按 OAuth state 定位会话并投递回调数据。
@@ -2765,10 +2928,182 @@ impl AdminService {
         drop(sessions);
         match tx {
             Some(tx) => {
-                if tx.send(data).is_ok() {
+                if tx.send(social::CallbackResult::Social(data)).is_ok() {
                     RemoteCallbackOutcome::Delivered
                 } else {
                     // 接收端已消失（会话被并发完成/移除）→ 视为已处理
+                    RemoteCallbackOutcome::AlreadyCompleted
+                }
+            }
+            None => RemoteCallbackOutcome::AlreadyCompleted,
+        }
+    }
+
+    /// 远程模式 external_idp 描述符腿：做 OIDC discovery，存储 leg-2 上下文，
+    /// 返回 `Redirect(authorize_url)` 让 handler 302 重定向浏览器到企业 IdP 登录页。
+    ///
+    /// `portal_state`：portal 发来的 state（用于定位会话）。
+    /// `callback_base`：本服务的公网回调 base（leg-2 redirect_uri 用这个拼）。
+    pub async fn deliver_remote_external_idp_descriptor(
+        &self,
+        portal_state: &str,
+        issuer_url: &str,
+        client_id: &str,
+        scopes: &str,
+        login_hint: &str,
+    ) -> RemoteCallbackOutcome {
+        // 找到对应会话
+        let (session_id, proxy, allowed) = {
+            let sessions = self.social_sessions.lock();
+            let entry = sessions
+                .iter()
+                .find(|(_, s)| s.state == portal_state && s.remote_callback_tx.is_some());
+            let Some((id, s)) = entry else {
+                return RemoteCallbackOutcome::NotFound;
+            };
+            if Utc::now() >= s.expires_at {
+                return RemoteCallbackOutcome::Expired;
+            }
+            (
+                id.clone(),
+                s.proxy.clone(),
+                self.token_manager.config().effective_external_idp_allowed_hosts(),
+            )
+        };
+
+        let config = self.token_manager.config().clone();
+
+        // OIDC discovery（校验 issuer + 两端点，禁止重定向）
+        let (auth_endpoint, token_endpoint) = match external_idp::oidc_discover(
+            issuer_url,
+            &allowed,
+            &config,
+            proxy.as_ref(),
+        )
+        .await
+        {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::warn!("远程 external_idp OIDC discovery 失败: {}", e);
+                return RemoteCallbackOutcome::NotFound; // handler 会渲染错误页
+            }
+        };
+
+        use crate::kiro::auth::social::generate_pkce;
+        let (verifier, challenge) = generate_pkce();
+        let leg2_state = uuid::Uuid::new_v4().to_string();
+        // leg-2 redirect_uri 必须是 Kiro Entra 应用已注册的 loopback 地址，
+        // 否则 Entra 返回 AADSTS50011。这里用 IDE / Python helper 同款的 localhost:3128。
+        // 远程部署时浏览器打不开该地址，需用户手动把地址改成公网回调路由
+        // （/api/admin/auth/callback/oauth/callback?code=...&state=...，state 不变即可匹配会话）。
+        // 兑换 token 时会用同一个 redirect_uri（存入 leg-2 ctx），保证与授权请求一致。
+        let redirect_uri = "http://localhost:3128/oauth/callback".to_string();
+        let authorize_url = external_idp::build_authorize_url(
+            &auth_endpoint,
+            client_id,
+            &redirect_uri,
+            scopes,
+            &challenge,
+            &leg2_state,
+            login_hint,
+        );
+
+        // 存储 leg-2 上下文（供 leg-2 code 腿消费）
+        {
+            let sessions = self.social_sessions.lock();
+            if let Some(s) = sessions.get(&session_id) {
+                if let Some(slot) = s.remote_leg2.as_ref() {
+                    *slot.lock() = Some(RemoteLeg2Ctx {
+                        state: leg2_state,
+                        verifier,
+                        token_endpoint,
+                        issuer_url: issuer_url.to_string(),
+                        client_id: client_id.to_string(),
+                        scopes: scopes.to_string(),
+                        redirect_uri,
+                    });
+                } else {
+                    // 首次：remote_leg2 还是 None，需要在持锁外设置 —— 解锁后再补
+                    drop(sessions);
+                    let mut sessions = self.social_sessions.lock();
+                    if let Some(s) = sessions.get_mut(&session_id) {
+                        s.remote_leg2 = Some(Mutex::new(Some(RemoteLeg2Ctx {
+                            state: leg2_state,
+                            verifier,
+                            token_endpoint,
+                            issuer_url: issuer_url.to_string(),
+                            client_id: client_id.to_string(),
+                            scopes: scopes.to_string(),
+                            redirect_uri,
+                        })));
+                    }
+                }
+            }
+        }
+
+        RemoteCallbackOutcome::Redirect(authorize_url)
+    }
+
+    /// 远程模式 external_idp leg-2 code 腿：按 leg-2 state 找会话，包装成
+    /// `CallbackResult::ExternalIdp` 投递 channel，由 `poll_social_login` 统一完成兑换。
+    pub fn deliver_remote_external_idp_code(
+        &self,
+        leg2_state: &str,
+        code: &str,
+    ) -> RemoteCallbackOutcome {
+        // 按 leg-2 state 找会话（leg-2 state 与 portal state 不同）
+        let session_id = {
+            let sessions = self.social_sessions.lock();
+            sessions.iter().find_map(|(id, s)| {
+                s.remote_leg2.as_ref().and_then(|slot| {
+                    slot.lock().as_ref().and_then(|ctx| {
+                        (ctx.state == leg2_state).then_some(id.clone())
+                    })
+                })
+            })
+        };
+        let Some(session_id) = session_id else {
+            return RemoteCallbackOutcome::NotFound;
+        };
+
+        let sessions = self.social_sessions.lock();
+        let Some(session) = sessions.get(&session_id) else {
+            return RemoteCallbackOutcome::NotFound;
+        };
+        if Utc::now() >= session.expires_at {
+            return RemoteCallbackOutcome::Expired;
+        }
+
+        // 取出 leg-2 上下文（消费一次）
+        let ctx = session
+            .remote_leg2
+            .as_ref()
+            .and_then(|slot| slot.lock().take());
+        let Some(ctx) = ctx else {
+            return RemoteCallbackOutcome::AlreadyCompleted;
+        };
+
+        let tx = session
+            .remote_callback_tx
+            .as_ref()
+            .and_then(|slot| slot.lock().take());
+        drop(sessions);
+
+        let result = social::CallbackResult::ExternalIdp(social::ExternalIdpCallback {
+            code: code.to_string(),
+            code_verifier: ctx.verifier,
+            token_endpoint: ctx.token_endpoint,
+            client_id: ctx.client_id,
+            issuer_url: ctx.issuer_url,
+            scopes: ctx.scopes,
+            redirect_uri: ctx.redirect_uri,
+        });
+
+        match tx {
+            Some(tx) => {
+                if tx.send(result).is_ok() {
+                    RemoteCallbackOutcome::Delivered
+                } else {
                     RemoteCallbackOutcome::AlreadyCompleted
                 }
             }
@@ -3010,18 +3345,22 @@ impl AdminService {
 
         // 回调模式同 start_social_login：远程模式走公网回调路由，本地模式走临时端口
         let remote_base = self.resolve_callback_base(req.callback_base_url.as_deref());
-        let (redirect_uri, server_handle, remote_callback_tx, rx) = match remote_base.clone() {
+        let (redirect_uri, server_handle, remote_callback_tx, remote_leg2_init, rx) = match remote_base.clone() {
             Some(base) => {
-                let (tx, rx) = tokio::sync::oneshot::channel::<social::OAuthCallbackData>();
-                (base, None, Some(Mutex::new(Some(tx))), rx)
+                let (tx, rx) = tokio::sync::oneshot::channel::<social::CallbackResult>();
+                (base, None, Some(Mutex::new(Some(tx))), Some(Mutex::new(None::<RemoteLeg2Ctx>)), rx)
             }
             None => {
-                let (tx, rx) = tokio::sync::oneshot::channel::<social::OAuthCallbackData>();
-                let (port, server_handle) = social::start_callback_server(tx)
-                    .map_err(|e| AdminServiceError::InternalError(e.to_string()))?;
+                let (tx, rx) = tokio::sync::oneshot::channel::<social::CallbackResult>();
+                let config = self.token_manager.config().clone();
+                let allowed = config.effective_external_idp_allowed_hosts();
+                let (port, server_handle) =
+                    social::start_callback_server(tx, config, proxy.clone(), allowed)
+                        .map_err(|e| AdminServiceError::InternalError(e.to_string()))?;
                 (
                     format!("http://127.0.0.1:{}", port),
                     Some(server_handle),
+                    None,
                     None,
                     rx,
                 )
@@ -3043,6 +3382,7 @@ impl AdminService {
             proxy,
             _server_handle: server_handle,
             remote_callback_tx,
+            remote_leg2: remote_leg2_init,
             relogin_target_id: Some(target_id),
         };
 

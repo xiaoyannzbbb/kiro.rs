@@ -38,6 +38,16 @@ pub struct Config {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub callback_base_url: Option<String>,
 
+    /// 允许的外部 IdP（external_idp 登录）主机后缀白名单（SSRF 防护）。
+    ///
+    /// 未配置时使用 Microsoft Entra 默认集合（见
+    /// [`crate::kiro::auth::external_idp::DEFAULT_ALLOWED_IDP_SUFFIXES`]）。
+    /// 配置后将「替换」默认集合，可用于接入其它企业 IdP（如 `.okta.com`）。
+    /// 后缀建议以 `.` 开头以锚定子域边界。
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub external_idp_allowed_hosts: Option<Vec<String>>,
+
     #[serde(default = "default_region")]
     pub region: String,
 
@@ -251,6 +261,7 @@ impl Default for Config {
             host: default_host(),
             port: default_port(),
             callback_base_url: None,
+            external_idp_allowed_hosts: None,
             region: default_region(),
             auth_region: None,
             api_region: None,
@@ -302,6 +313,20 @@ impl Config {
     /// 优先使用 api_region，未配置时回退到 region
     pub fn effective_api_region(&self) -> &str {
         self.api_region.as_deref().unwrap_or(&self.region)
+    }
+
+    /// 返回 external_idp 登录允许的 IdP 主机后缀白名单。
+    ///
+    /// 已配置 `external_idp_allowed_hosts`（且非空）时使用配置值，否则回退到
+    /// Microsoft Entra 默认集合。
+    pub fn effective_external_idp_allowed_hosts(&self) -> Vec<String> {
+        match &self.external_idp_allowed_hosts {
+            Some(list) if !list.is_empty() => list.clone(),
+            _ => crate::kiro::auth::external_idp::DEFAULT_ALLOWED_IDP_SUFFIXES
+                .iter()
+                .map(|s| s.to_string())
+                .collect(),
+        }
     }
 
     /// 从文件加载配置

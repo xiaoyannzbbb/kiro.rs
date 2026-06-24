@@ -49,7 +49,25 @@ pub fn build_client(
     timeout_secs: u64,
     tls_backend: TlsBackend,
 ) -> anyhow::Result<Client> {
+    build_client_with_redirect(proxy, timeout_secs, tls_backend, true)
+}
+
+/// 构建 HTTP Client，可控制是否跟随重定向
+///
+/// 大多数调用走 [`build_client`]（跟随重定向）。OIDC discovery 等场景须传
+/// `follow_redirects = false`，避免 discovery 主机把请求 bounce 到内网目标
+/// （SSRF 防护的一环）。
+pub fn build_client_with_redirect(
+    proxy: Option<&ProxyConfig>,
+    timeout_secs: u64,
+    tls_backend: TlsBackend,
+    follow_redirects: bool,
+) -> anyhow::Result<Client> {
     let mut builder = Client::builder().timeout(Duration::from_secs(timeout_secs));
+
+    if !follow_redirects {
+        builder = builder.redirect(reqwest::redirect::Policy::none());
+    }
 
     match tls_backend {
         TlsBackend::Rustls => {

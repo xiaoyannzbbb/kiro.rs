@@ -122,6 +122,8 @@ async fn main() {
         endpoints.insert(ide.name().to_string(), Arc::new(ide));
         let cli = CliEndpoint::new();
         endpoints.insert(cli.name().to_string(), Arc::new(cli));
+        let external_idp = crate::kiro::endpoint::ExternalIdpEndpoint::new();
+        endpoints.insert(external_idp.name().to_string(), Arc::new(external_idp));
     }
 
     // 校验默认端点存在

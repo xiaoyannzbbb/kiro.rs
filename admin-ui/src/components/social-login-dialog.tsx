@@ -217,9 +217,10 @@ export function SocialLoginDialog({ open, onOpenChange, onSuccess }: SocialLogin
     <Dialog open={open} onOpenChange={handleOpenChange}>
       <DialogContent className="sm:max-w-md">
         <DialogHeader>
-          <DialogTitle>Kiro 账号登录（Google / GitHub）</DialogTitle>
+          <DialogTitle>Kiro 账号登录</DialogTitle>
           <DialogDescription>
-            通过 Kiro 网页端完成 Social 登录，无需手动导出 refreshToken。
+            通过 Kiro 网页端完成登录，支持 Google、GitHub 及企业账号（Microsoft 365 / Entra ID）。
+            输入邮箱后 Kiro 会自动识别账号类型。
           </DialogDescription>
         </DialogHeader>
 
@@ -245,7 +246,8 @@ export function SocialLoginDialog({ open, onOpenChange, onSuccess }: SocialLogin
                 <span className="font-medium">使用无痕窗口登录</span>
                 <span className="mt-0.5 block text-xs text-muted-foreground">
                   发起后复制登录链接，自行用浏览器无痕/隐身窗口（Ctrl+Shift+N）打开，
-                  避免与当前已登录的 Google / GitHub 账号串号。
+                  避免与当前已登录的 Google / GitHub / Microsoft 账号串号。
+                  企业账号（M365 / Entra ID）强烈建议勾选此项。
                 </span>
               </span>
             </label>

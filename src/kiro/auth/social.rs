@@ -13,6 +13,7 @@ use sha2::{Digest, Sha256};
 use tokio::sync::oneshot;
 
 use crate::http_client::{ProxyConfig, build_client};
+use crate::kiro::auth::external_idp;
 use crate::kiro::model::token_refresh::{SocialCreateTokenRequest, SocialCreateTokenResponse};
 use crate::model::config::Config;
 
@@ -37,6 +38,41 @@ pub struct OAuthCallbackData {
     pub state: String,
 }
 
+/// 回调服务器最终投递给等待方的结果。
+///
+/// social（Google/GitHub）与 external_idp（企业 IdP）登录共用同一个 Kiro 登录页和
+/// 同一个 loopback 监听器，由 portal 根据邮箱决定走哪条腿。
+pub enum CallbackResult {
+    /// social 直接授权码回调（现有路径）
+    Social(OAuthCallbackData),
+    /// external_idp 第二腿（leg-2）捕获到的授权码及兑换上下文
+    ExternalIdp(ExternalIdpCallback),
+}
+
+/// external_idp leg-2 捕获到的授权码及在 IdP token 端点兑换所需的上下文。
+pub struct ExternalIdpCallback {
+    pub code: String,
+    /// leg-2 PKCE code_verifier
+    pub code_verifier: String,
+    pub token_endpoint: String,
+    pub client_id: String,
+    pub issuer_url: String,
+    pub scopes: String,
+    /// leg-2 发给 IdP 的 redirect_uri（兑换时须原样回传）
+    pub redirect_uri: String,
+}
+
+/// external_idp 描述符腿（leg-1）建立、code 腿（leg-2）消费的中间状态。
+struct Leg2Ctx {
+    state: String,
+    verifier: String,
+    token_endpoint: String,
+    issuer_url: String,
+    client_id: String,
+    scopes: String,
+    redirect_uri: String,
+}
+
 /// 回调服务器关闭句柄
 ///
 /// Drop 时自动向服务器发送关闭信号，服务器退出监听循环并释放端口。
@@ -46,9 +82,16 @@ pub struct ServerHandle {
 
 /// 启动本地回调服务器，返回端口号和关闭句柄
 ///
-/// 关闭句柄 drop 时服务器自动停止。当收到有效的 OAuth 回调时，通过 channel 发送回调数据。
+/// 关闭句柄 drop 时服务器自动停止。当收到有效的 OAuth 回调时，通过 channel 发送
+/// [`CallbackResult`]（social 直接授权码 或 external_idp leg-2 授权码）。
+///
+/// `config` / `proxy` / `allowed_idp_suffixes` 仅在企业 external_idp 描述符腿做
+/// OIDC discovery 时使用；纯 social 登录不会触及。
 pub fn start_callback_server(
-    tx: oneshot::Sender<OAuthCallbackData>,
+    tx: oneshot::Sender<CallbackResult>,
+    config: Config,
+    proxy: Option<ProxyConfig>,
+    allowed_idp_suffixes: Vec<String>,
 ) -> anyhow::Result<(u16, ServerHandle)> {
     // 直接持有已绑定的 socket，避免 probe-and-bind 的 TOCTOU 竞态
     let (port, std_listener) = bind_available_port()?;
@@ -56,7 +99,15 @@ pub fn start_callback_server(
     let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
 
     tokio::spawn(async move {
-        run_callback_server(std_listener, tx, shutdown_rx).await;
+        run_callback_server(
+            std_listener,
+            tx,
+            shutdown_rx,
+            config,
+            proxy,
+            allowed_idp_suffixes,
+        )
+        .await;
     });
 
     Ok((
@@ -85,10 +136,13 @@ fn bind_available_port() -> anyhow::Result<(u16, std::net::TcpListener)> {
 
 async fn run_callback_server(
     std_listener: std::net::TcpListener,
-    tx: oneshot::Sender<OAuthCallbackData>,
+    tx: oneshot::Sender<CallbackResult>,
     mut shutdown_rx: oneshot::Receiver<()>,
+    config: Config,
+    proxy: Option<ProxyConfig>,
+    allowed_idp_suffixes: Vec<String>,
 ) {
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::io::AsyncReadExt;
     use tokio::net::TcpListener;
 
     let port = std_listener.local_addr().map(|a| a.port()).unwrap_or(0);
@@ -102,8 +156,11 @@ async fn run_callback_server(
 
     tracing::info!("Social 回调服务器已启动: http://127.0.0.1:{}", port);
 
-    // 只等待一次成功的回调，或关闭信号
+    // 只投递一次成功结果；external_idp 双腿流程跨多次请求，故循环不在描述符腿提前退出。
     let mut tx = Some(tx);
+    // external_idp leg-2 上下文（描述符腿建立，code 腿消费）
+    let mut leg2: Option<Leg2Ctx> = None;
+
     loop {
         let (mut stream, _addr) = tokio::select! {
             result = listener.accept() => match result {
@@ -116,7 +173,7 @@ async fn run_callback_server(
             }
         };
 
-        let mut buf = vec![0u8; 4096];
+        let mut buf = vec![0u8; 8192];
         let n = match stream.read(&mut buf).await {
             Ok(n) => n,
             Err(_) => continue,
@@ -125,60 +182,218 @@ async fn run_callback_server(
         let request = String::from_utf8_lossy(&buf[..n]);
         let first_line = request.lines().next().unwrap_or("");
 
-        // GET /oauth/callback?... HTTP/1.1
-        if let Some(path_and_query) = first_line.strip_prefix("GET ").and_then(|s| {
+        // 仅处理 GET
+        let path_and_query = match first_line.strip_prefix("GET ").and_then(|s| {
             s.strip_suffix(" HTTP/1.1")
                 .or_else(|| s.strip_suffix(" HTTP/1.0"))
         }) {
-            if let Some(callback) = parse_callback(path_and_query) {
-                let body = "<html><head><meta charset='utf-8'><title>登录成功</title></head><body style='font-family:sans-serif;text-align:center;padding:60px'><h2>&#10003; 登录成功</h2><p>Token 已更新，请返回 Kiro Admin UI。</p><p style='color:#888;font-size:13px'>此标签页可以关闭。</p></body></html>";
-                let response = format!(
-                    "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-                    body.len(),
-                    body
-                );
-                let _ = stream.write_all(response.as_bytes()).await;
-                let _ = stream.flush().await;
+            Some(p) => p,
+            None => {
+                write_404(&mut stream).await;
+                continue;
+            }
+        };
 
-                if let Some(sender) = tx.take() {
-                    let _ = sender.send(callback);
-                }
-                break;
-            } else if path_and_query.starts_with("/oauth/callback")
-                || path_and_query.starts_with("/signin/callback")
+        let (path, query) = match path_and_query.find('?') {
+            Some(idx) => (&path_and_query[..idx], &path_and_query[idx + 1..]),
+            None => (path_and_query, ""),
+        };
+        let params = parse_query_string(query);
+
+        // --- external_idp 描述符腿（leg-1）：无 code，带 issuer_url / login_option=external_idp ---
+        // 与 Python 一致：gate 在 path != /oauth/callback，避免伪造的 /oauth/callback 重置 leg-2。
+        let is_descriptor = params
+            .get("login_option")
+            .map(|v| v.eq_ignore_ascii_case("external_idp"))
+            .unwrap_or(false)
+            || params
+                .get("issuer_url")
+                .map(|v| !v.is_empty())
+                .unwrap_or(false);
+
+        if path != "/oauth/callback" && is_descriptor {
+            if leg2.is_some() {
+                // 已在进行中的 leg-2，忽略重复描述符
+                write_status(&mut stream, 204).await;
+                continue;
+            }
+
+            let issuer_url = params.get("issuer_url").cloned().unwrap_or_default();
+            let client_id = params.get("client_id").cloned().unwrap_or_default();
+            let scopes = params.get("scopes").cloned().unwrap_or_default();
+            let login_hint = params.get("login_hint").cloned().unwrap_or_default();
+
+            if client_id.is_empty() {
+                tracing::warn!("external_idp 描述符缺少 client_id");
+                write_html_page(&mut stream, false, "外部 IdP 描述符缺少 client_id，请重试。")
+                    .await;
+                break; // 关闭 channel → 上层报错
+            }
+
+            // OIDC discovery（校验 issuer + authorize/token 两端点，禁止跟随重定向）
+            let (auth_endpoint, token_endpoint) = match external_idp::oidc_discover(
+                &issuer_url,
+                &allowed_idp_suffixes,
+                &config,
+                proxy.as_ref(),
+            )
+            .await
             {
-                // 有 error 参数的回调
-                let error_msg = path_and_query
-                    .split('?')
-                    .nth(1)
-                    .and_then(|q| {
-                        let p = parse_query_string(q);
-                        p.get("error_description")
-                            .or_else(|| p.get("error"))
-                            .cloned()
-                    })
-                    .unwrap_or_else(|| "未知错误".to_string());
+                Ok(v) => v,
+                Err(e) => {
+                    tracing::warn!("external_idp OIDC discovery 失败: {}", e);
+                    write_html_page(&mut stream, false, "外部 IdP discovery 失败，请重试。").await;
+                    break;
+                }
+            };
 
-                let body = format!(
-                    "<html><head><meta charset='utf-8'><title>登录失败</title></head><body style='font-family:sans-serif;text-align:center;padding:60px'><h2>&#10007; 登录失败</h2><p>{}</p><p style='color:#888;font-size:13px'>请关闭此标签页并重试。</p></body></html>",
-                    error_msg
-                );
-                let response = format!(
-                    "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-                    body.len(),
-                    body
-                );
-                let _ = stream.write_all(response.as_bytes()).await;
-                let _ = stream.flush().await;
-                break;
+            let (verifier, challenge) = generate_pkce();
+            let state2 = uuid::Uuid::new_v4().to_string();
+            // leg-2 redirect_uri：照搬 Kiro IDE / Python 的 loopback 约定（host=localhost），
+            // 端口用实际绑定端口（取自与 IDE 一致的 CALLBACK_PORTS）。
+            let redirect_uri = format!("http://localhost:{}/oauth/callback", port);
+            let authorize_url = external_idp::build_authorize_url(
+                &auth_endpoint,
+                &client_id,
+                &redirect_uri,
+                &scopes,
+                &challenge,
+                &state2,
+                &login_hint,
+            );
+
+            leg2 = Some(Leg2Ctx {
+                state: state2,
+                verifier,
+                token_endpoint,
+                issuer_url,
+                client_id,
+                scopes,
+                redirect_uri,
+            });
+
+            // 302 把同一浏览器标签页跳转到企业 IdP 登录页
+            write_redirect(&mut stream, &authorize_url).await;
+            continue;
+        }
+
+        // --- external_idp 第二腿（leg-2）：/oauth/callback 且存在 leg-2 上下文 ---
+        if path == "/oauth/callback" {
+            if let Some(ctx) = leg2.as_ref() {
+                let cb_state = params.get("state").cloned().unwrap_or_default();
+                if !cb_state.is_empty() && cb_state == ctx.state {
+                    if let Some(err) = params.get("error") {
+                        let desc = params
+                            .get("error_description")
+                            .cloned()
+                            .unwrap_or_default();
+                        tracing::warn!("external_idp 授权错误: {} {}", err, desc);
+                        write_html_page(&mut stream, false, "外部 IdP 授权失败，请重试。").await;
+                        break;
+                    }
+                    let code = params.get("code").cloned().unwrap_or_default();
+                    if code.is_empty() {
+                        write_status(&mut stream, 204).await;
+                        continue;
+                    }
+                    write_html_page(
+                        &mut stream,
+                        true,
+                        "登录成功，Token 已更新，请返回 Kiro Admin UI。",
+                    )
+                    .await;
+                    if let Some(sender) = tx.take() {
+                        let _ = sender.send(CallbackResult::ExternalIdp(ExternalIdpCallback {
+                            code,
+                            code_verifier: ctx.verifier.clone(),
+                            token_endpoint: ctx.token_endpoint.clone(),
+                            client_id: ctx.client_id.clone(),
+                            issuer_url: ctx.issuer_url.clone(),
+                            scopes: ctx.scopes.clone(),
+                            redirect_uri: ctx.redirect_uri.clone(),
+                        }));
+                    }
+                    break;
+                }
+                // state 不匹配 → 落到下方 social 解析（伪造/陈旧回调将在上层 CSRF 处失败）
             }
         }
 
-        // 其他请求返回 404
-        let _ = stream
-            .write_all(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n")
+        // --- social 直接授权码腿（现有逻辑）---
+        if let Some(callback) = parse_callback(path_and_query) {
+            write_html_page(
+                &mut stream,
+                true,
+                "登录成功，Token 已更新，请返回 Kiro Admin UI。",
+            )
             .await;
+            if let Some(sender) = tx.take() {
+                let _ = sender.send(CallbackResult::Social(callback));
+            }
+            break;
+        } else if path == "/oauth/callback" || path == "/signin/callback" {
+            // 带 error 参数的回调
+            let error_msg = params
+                .get("error_description")
+                .or_else(|| params.get("error"))
+                .cloned()
+                .unwrap_or_else(|| "未知错误".to_string());
+            write_html_page(&mut stream, false, &error_msg).await;
+            break;
+        }
+
+        // 其他请求返回 404
+        write_404(&mut stream).await;
     }
+}
+
+/// 写一个带成功 / 失败样式的 200 HTML 提示页。
+async fn write_html_page(stream: &mut tokio::net::TcpStream, success: bool, message: &str) {
+    use tokio::io::AsyncWriteExt;
+    let heading = if success {
+        "<h2>&#10003; 登录成功</h2>".to_string()
+    } else {
+        "<h2>&#10007; 登录失败</h2>".to_string()
+    };
+    let title = if success { "登录成功" } else { "登录失败" };
+    let body = format!(
+        "<html><head><meta charset='utf-8'><title>{}</title></head><body style='font-family:sans-serif;text-align:center;padding:60px'>{}<p>{}</p><p style='color:#888;font-size:13px'>此标签页可以关闭。</p></body></html>",
+        title, heading, message
+    );
+    let response = format!(
+        "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+        body.len(),
+        body
+    );
+    let _ = stream.write_all(response.as_bytes()).await;
+    let _ = stream.flush().await;
+}
+
+/// 写一个 302 重定向响应（用于 external_idp leg-1 跳转到 IdP）。
+async fn write_redirect(stream: &mut tokio::net::TcpStream, location: &str) {
+    use tokio::io::AsyncWriteExt;
+    let response = format!(
+        "HTTP/1.1 302 Found\r\nLocation: {}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+        location
+    );
+    let _ = stream.write_all(response.as_bytes()).await;
+    let _ = stream.flush().await;
+}
+
+/// 写一个无 body 的状态响应（如 204，用于忽略重复/无效回调）。
+async fn write_status(stream: &mut tokio::net::TcpStream, code: u16) {
+    use tokio::io::AsyncWriteExt;
+    let response = format!("HTTP/1.1 {} \r\nContent-Length: 0\r\nConnection: close\r\n\r\n", code);
+    let _ = stream.write_all(response.as_bytes()).await;
+    let _ = stream.flush().await;
+}
+
+async fn write_404(stream: &mut tokio::net::TcpStream) {
+    use tokio::io::AsyncWriteExt;
+    let _ = stream
+        .write_all(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+        .await;
+    let _ = stream.flush().await;
 }
 
 fn parse_callback(path_and_query: &str) -> Option<OAuthCallbackData> {

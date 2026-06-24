@@ -148,3 +148,32 @@ pub struct SocialCreateTokenResponse {
     #[serde(default)]
     pub profile_arn: Option<String>,
 }
+
+// ============ External IdP（企业 IdP / Entra）登录流程 ============
+
+/// 外部 IdP（OIDC）token 端点响应体。
+///
+/// 与 social/idc 不同，标准 OAuth2 / OIDC token 端点返回 **snake_case** 字段，
+/// 故单独定义。用于授权码兑换（`exchange_code`）与刷新（`refresh`）两个场景。
+#[derive(Debug, Deserialize)]
+pub struct ExternalIdpTokenResponse {
+    pub access_token: String,
+    #[serde(default)]
+    pub refresh_token: Option<String>,
+    #[serde(default)]
+    pub expires_in: Option<i64>,
+    #[serde(default)]
+    #[allow(dead_code)]
+    pub token_type: Option<String>,
+    #[serde(default)]
+    #[allow(dead_code)]
+    pub scope: Option<String>,
+}
+
+/// 外部 IdP token 端点错误响应（OAuth2 标准错误体）
+#[derive(Debug, Deserialize)]
+pub struct ExternalIdpErrorResponse {
+    pub error: String,
+    #[serde(default)]
+    pub error_description: Option<String>,
+}

@@ -645,7 +645,8 @@ pub async fn social_oauth_callback(
     State(state): State<AdminState>,
     Path(tail): Path<String>,
     Query(params): Query<std::collections::HashMap<String, String>>,
-) -> Html<String> {
+) -> axum::response::Response {
+    use axum::response::IntoResponse;
     use crate::kiro::auth::social::OAuthCallbackData;
     use super::service::RemoteCallbackOutcome;
 
@@ -656,45 +657,77 @@ pub async fn social_oauth_callback(
             .or_else(|| params.get("error"))
             .cloned()
             .unwrap_or_else(|| "未知错误".to_string());
-        return Html(render_callback_page(false, &format!("授权失败：{}", msg)));
+        return Html(render_callback_page(false, &format!("授权失败：{}", msg))).into_response();
     }
 
-    let Some(code) = params.get("code").cloned() else {
-        return Html(render_callback_page(false, "回调缺少 code 参数"));
-    };
-    let oauth_state = params.get("state").cloned().unwrap_or_default();
-    let login_option = params.get("login_option").cloned().unwrap_or_default();
-    // portal 追加的路径（oauth/callback 或 signin/callback），用于还原 token 兑换用的 redirect_uri
     let path = {
         let trimmed = tail.trim_start_matches('/');
-        if trimmed.is_empty() {
-            "/oauth/callback".to_string()
-        } else {
-            format!("/{}", trimmed)
-        }
+        if trimmed.is_empty() { "/oauth/callback".to_string() } else { format!("/{}", trimmed) }
     };
 
-    let data = OAuthCallbackData {
-        code,
-        login_option,
-        path,
-        state: oauth_state.clone(),
-    };
+    // --- external_idp 描述符腿（无 code，有 issuer_url / login_option=external_idp）---
+    let is_descriptor = params.get("login_option")
+        .map(|v| v.eq_ignore_ascii_case("external_idp")).unwrap_or(false)
+        || params.get("issuer_url").map(|v| !v.is_empty()).unwrap_or(false);
 
-    match state.service.deliver_remote_social_callback(&oauth_state, data) {
-        RemoteCallbackOutcome::Delivered => {
-            Html(render_callback_page(true, "登录回调已收到，请返回 Kiro Admin 标签页查看结果"))
+    if is_descriptor && !params.contains_key("code") {
+        let portal_state = params.get("state").cloned().unwrap_or_default();
+        let issuer_url   = params.get("issuer_url").cloned().unwrap_or_default();
+        let client_id    = params.get("client_id").cloned().unwrap_or_default();
+        let scopes       = params.get("scopes").cloned().unwrap_or_default();
+        let login_hint   = params.get("login_hint").cloned().unwrap_or_default();
+
+        match state.service.deliver_remote_external_idp_descriptor(
+            &portal_state, &issuer_url, &client_id, &scopes, &login_hint,
+        ).await {
+            RemoteCallbackOutcome::Redirect(url) => {
+                // 302 把同一浏览器标签页跳到企业 IdP 登录页
+                axum::response::Redirect::to(&url).into_response()
+            }
+            RemoteCallbackOutcome::NotFound => Html(render_callback_page(
+                false, "未找到对应的登录会话或 OIDC discovery 失败，请回到管理面板重新发起登录",
+            )).into_response(),
+            RemoteCallbackOutcome::Expired => Html(render_callback_page(
+                false, "登录会话已过期，请回到管理面板重新发起登录",
+            )).into_response(),
+            _ => Html(render_callback_page(false, "内部错误，请重试")).into_response(),
         }
-        RemoteCallbackOutcome::AlreadyCompleted => {
-            Html(render_callback_page(true, "该登录回调已处理过，请返回 Kiro Admin 标签页"))
+
+    // --- external_idp leg-2：/oauth/callback 带 code，state 是 leg-2 state ---
+    // 先尝试按 leg-2 state 找 external_idp 会话；找不到再走 social 路径
+    } else if let Some(code) = params.get("code").cloned() {
+        let oauth_state = params.get("state").cloned().unwrap_or_default();
+
+        // 先试 external_idp leg-2 路径
+        let leg2_outcome = state.service
+            .deliver_remote_external_idp_code(&oauth_state, &code);
+
+        match leg2_outcome {
+            RemoteCallbackOutcome::Delivered => {
+                Html(render_callback_page(true, "企业账号登录回调已收到，请返回 Kiro Admin 标签页查看结果")).into_response()
+            }
+            RemoteCallbackOutcome::NotFound => {
+                // 不是 external_idp leg-2 → 走 social 路径
+                let login_option = params.get("login_option").cloned().unwrap_or_default();
+                let data = OAuthCallbackData { code, login_option, path, state: oauth_state.clone() };
+                match state.service.deliver_remote_social_callback(&oauth_state, data) {
+                    RemoteCallbackOutcome::Delivered =>
+                        Html(render_callback_page(true, "登录回调已收到，请返回 Kiro Admin 标签页查看结果")).into_response(),
+                    RemoteCallbackOutcome::AlreadyCompleted =>
+                        Html(render_callback_page(true, "该登录回调已处理过，请返回 Kiro Admin 标签页")).into_response(),
+                    RemoteCallbackOutcome::Expired =>
+                        Html(render_callback_page(false, "登录会话已过期，请回到管理面板重新发起登录")).into_response(),
+                    _ => Html(render_callback_page(false, "未找到对应的登录会话，请回到管理面板重新发起")).into_response(),
+                }
+            }
+            RemoteCallbackOutcome::AlreadyCompleted =>
+                Html(render_callback_page(true, "该登录回调已处理过，请返回 Kiro Admin 标签页")).into_response(),
+            RemoteCallbackOutcome::Expired =>
+                Html(render_callback_page(false, "登录会话已过期，请回到管理面板重新发起登录")).into_response(),
+            _ => Html(render_callback_page(false, "内部错误，请重试")).into_response(),
         }
-        RemoteCallbackOutcome::Expired => {
-            Html(render_callback_page(false, "登录会话已过期，请回到管理面板重新发起登录"))
-        }
-        RemoteCallbackOutcome::NotFound => Html(render_callback_page(
-            false,
-            "未找到对应的登录会话（可能未配置回调地址或会话已失效），请回到管理面板重新发起",
-        )),
+    } else {
+        Html(render_callback_page(false, "回调缺少 code 参数")).into_response()
     }
 }
 

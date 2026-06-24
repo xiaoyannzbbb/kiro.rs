@@ -141,6 +141,9 @@ pub mod outcome {
     pub const UNKNOWN: &str = "unknown";
     /// 仅用作 record.error_type：流式响应已开始但上游中途断开
     pub const STREAM_INTERRUPTED: &str = "stream_interrupted";
+    /// 仅用作 record.error_type：客户端在流式响应完成前断开连接，
+    /// 由 RequestTracer 的 Drop 兜底补记（finalize 未被显式调用）。
+    pub const CLIENT_DISCONNECTED: &str = "client_disconnected";
 }
 
 /// 把上游错误体截断到安全长度（按字符边界，避免切碎 UTF-8）

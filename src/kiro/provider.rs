@@ -168,10 +168,16 @@ impl KiroProvider {
         &self,
         credentials: &KiroCredentials,
     ) -> anyhow::Result<Arc<dyn KiroEndpoint>> {
-        let name = credentials
-            .endpoint
-            .as_deref()
-            .unwrap_or(&self.default_endpoint);
+        // 企业 external_idp 账号强制走 kiro.dev CLI 端点（与凭据 endpoint 字段无关）：
+        // 这些账号的 Claude 目录只在 KIRO_CLI origin 下暴露。
+        let name = if credentials.is_external_idp() {
+            crate::kiro::endpoint::external_idp::EXTERNAL_IDP_ENDPOINT_NAME
+        } else {
+            credentials
+                .endpoint
+                .as_deref()
+                .unwrap_or(&self.default_endpoint)
+        };
         self.endpoints
             .get(name)
             .cloned()

@@ -83,8 +83,8 @@ impl KiroEndpoint for IdeEndpoint {
             .header("amz-sdk-request", "attempt=1; max=3")
             .header("Authorization", format!("Bearer {}", ctx.token));
 
-        if ctx.credentials.is_api_key_credential() {
-            req = req.header("tokentype", "API_KEY");
+        if let Some(tt) = ctx.credentials.token_type_header() {
+            req = req.header("tokentype", tt);
         }
         req
     }
@@ -101,8 +101,8 @@ impl KiroEndpoint for IdeEndpoint {
         if let Some(arn) = ctx.credentials.effective_profile_arn() {
             req = req.header("x-amzn-kiro-profile-arn", arn);
         }
-        if ctx.credentials.is_api_key_credential() {
-            req = req.header("tokentype", "API_KEY");
+        if let Some(tt) = ctx.credentials.token_type_header() {
+            req = req.header("tokentype", tt);
         }
         req
     }
@@ -113,7 +113,7 @@ impl KiroEndpoint for IdeEndpoint {
 }
 
 /// 将 profile_arn 注入到请求体 JSON 根对象
-fn inject_profile_arn(request_body: &str, profile_arn: Option<&str>) -> String {
+pub(crate) fn inject_profile_arn(request_body: &str, profile_arn: Option<&str>) -> String {
     if let Some(arn) = profile_arn {
         if let Ok(mut json) = serde_json::from_str::<serde_json::Value>(request_body) {
             json["profileArn"] = serde_json::Value::String(arn.to_string());

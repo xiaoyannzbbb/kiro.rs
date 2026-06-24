@@ -102,7 +102,7 @@ export interface AddCredentialRequest {
   accessToken?: string
   profileArn?: string
   expiresAt?: string
-  authMethod?: 'social' | 'idc' | 'api_key'
+  authMethod?: 'social' | 'idc' | 'api_key' | 'external_idp'
   provider?: string
   clientId?: string
   clientSecret?: string
@@ -119,6 +119,12 @@ export interface AddCredentialRequest {
   email?: string
   groups?: string[]
   sourceChannel?: string
+  /** 企业外部 IdP（external_idp）OIDC token 端点 */
+  tokenEndpoint?: string
+  /** 企业外部 IdP issuer URL */
+  issuerUrl?: string
+  /** 企业外部 IdP OAuth scopes */
+  scopes?: string
 }
 
 // 添加凭据响应
